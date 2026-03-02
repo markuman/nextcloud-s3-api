@@ -83,4 +83,5 @@ All requests are authenticated using **AWS Signature V4**. Each API key is bound
 
 ## License
 
-AGPL-3.0
+AGPL-3.0  
+Written by Claude Opus 4.6
