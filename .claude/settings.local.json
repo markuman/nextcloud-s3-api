@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:docs.nextcloud.com)",
+      "WebSearch"
+    ]
+  }
+}

@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<info xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	  xsi:noNamespaceSchemaLocation="https://apps.nextcloud.com/schema/apps/info.xsd">
+	<id>s3_api</id>
+	<name>S3 API</name>
+	<summary>Expose Nextcloud folders as S3-compatible buckets</summary>
+	<description><![CDATA[
+This app exposes Nextcloud folders as S3-compatible buckets.
+Users can mark folders as buckets in their personal settings and create API keys (readonly/readwrite) per bucket.
+The API is accessible via path-style S3 requests and supports AWS Signature V4 authentication.
+	]]></description>
+	<version>1.0.0</version>
+	<licence>agpl</licence>
+	<author>osuv</author>
+	<namespace>S3Api</namespace>
+	<category>files</category>
+	<dependencies>
+		<nextcloud min-version="28" max-version="31" />
+	</dependencies>
+	<settings>
+		<personal>OCA\S3Api\Settings\Personal</personal>
+		<personal-section>OCA\S3Api\Settings\PersonalSection</personal-section>
+	</settings>
+</info>
