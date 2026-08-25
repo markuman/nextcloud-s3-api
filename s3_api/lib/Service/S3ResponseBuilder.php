@@ -277,8 +277,11 @@ class S3ResponseBuilder {
 		$commonPrefixes = [];
 
 		// Jump straight to the deepest folder the prefix pins down, so a prefix
-		// like "repos/acme/" does not walk every sibling.
-		$literal = $prefix === '' ? '' : substr($prefix, 0, (int)strrpos($prefix, '/') + 1);
+		// like "repos/acme/" does not walk every sibling. A prefix with no
+		// slash pins nothing down and must start at the bucket root -- note
+		// that strrpos() returns false there, which must not be read as 0.
+		$lastSlash = strrpos($prefix, '/');
+		$literal = $lastSlash === false ? '' : substr($prefix, 0, $lastSlash + 1);
 		$start = $bucketFolder;
 		if ($literal !== '') {
 			$resolved = $this->resolveFolder($bucketFolder, rtrim($literal, '/'));
