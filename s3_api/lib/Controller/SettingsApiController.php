@@ -9,6 +9,7 @@ use OCA\S3Api\Service\BucketService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\AppFramework\Http;
+use OCP\AppFramework\Http\Attribute\NoAdminRequired;
 use OCP\AppFramework\Http\JSONResponse;
 use OCP\IRequest;
 
@@ -24,17 +25,13 @@ class SettingsApiController extends Controller {
 		parent::__construct($appName, $request);
 	}
 
-	/**
-	 * @NoAdminRequired
-	 */
+	#[NoAdminRequired]
 	public function listBuckets(): JSONResponse {
 		$buckets = $this->bucketService->listBuckets($this->userId);
 		return new JSONResponse(array_map(fn($b) => $b->jsonSerialize(), $buckets));
 	}
 
-	/**
-	 * @NoAdminRequired
-	 */
+	#[NoAdminRequired]
 	public function createBucket(): JSONResponse {
 		$folderPath = $this->request->getParam('folderPath', '');
 		$bucketName = $this->request->getParam('bucketName', '');
@@ -53,9 +50,7 @@ class SettingsApiController extends Controller {
 		}
 	}
 
-	/**
-	 * @NoAdminRequired
-	 */
+	#[NoAdminRequired]
 	public function deleteBucket(int $id): JSONResponse {
 		try {
 			$this->bucketService->deleteBucket($id, $this->userId);
@@ -65,9 +60,7 @@ class SettingsApiController extends Controller {
 		}
 	}
 
-	/**
-	 * @NoAdminRequired
-	 */
+	#[NoAdminRequired]
 	public function listKeys(int $bucketId): JSONResponse {
 		try {
 			$keys = $this->apiKeyService->listKeys($bucketId);
@@ -77,9 +70,7 @@ class SettingsApiController extends Controller {
 		}
 	}
 
-	/**
-	 * @NoAdminRequired
-	 */
+	#[NoAdminRequired]
 	public function createKey(int $bucketId): JSONResponse {
 		$permission = $this->request->getParam('permission', 'readonly');
 		$label = $this->request->getParam('label', '');
@@ -103,9 +94,7 @@ class SettingsApiController extends Controller {
 		}
 	}
 
-	/**
-	 * @NoAdminRequired
-	 */
+	#[NoAdminRequired]
 	public function deleteKey(int $bucketId, int $keyId): JSONResponse {
 		try {
 			$this->apiKeyService->deleteKey($keyId, $this->userId);

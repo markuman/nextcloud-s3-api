@@ -11,6 +11,8 @@ use OCA\S3Api\Service\S3AuthService;
 use OCA\S3Api\Service\S3ResponseBuilder;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
+use OCP\AppFramework\Http\Attribute\NoCSRFRequired;
+use OCP\AppFramework\Http\Attribute\PublicPage;
 use OCP\AppFramework\Http\DataDisplayResponse;
 use OCP\AppFramework\Http\Response;
 use OCP\AppFramework\Http\StreamResponse;
@@ -34,42 +36,32 @@ class S3Controller extends Controller {
 		parent::__construct($appName, $request);
 	}
 
-	/**
-	 * @PublicPage
-	 * @NoCSRFRequired
-	 */
+	#[PublicPage]
+	#[NoCSRFRequired]
 	public function listBucketsOrRoot(): Response {
 		return $this->handleRequest('');
 	}
 
-	/**
-	 * @PublicPage
-	 * @NoCSRFRequired
-	 */
+	#[PublicPage]
+	#[NoCSRFRequired]
 	public function handleGet(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
-	/**
-	 * @PublicPage
-	 * @NoCSRFRequired
-	 */
+	#[PublicPage]
+	#[NoCSRFRequired]
 	public function handlePut(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
-	/**
-	 * @PublicPage
-	 * @NoCSRFRequired
-	 */
+	#[PublicPage]
+	#[NoCSRFRequired]
 	public function handleDelete(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
-	/**
-	 * @PublicPage
-	 * @NoCSRFRequired
-	 */
+	#[PublicPage]
+	#[NoCSRFRequired]
 	public function handleHead(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}

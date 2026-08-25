@@ -15,7 +15,7 @@ The API is accessible via path-style S3 requests and supports AWS Signature V4 a
 	<namespace>S3Api</namespace>
 	<category>files</category>
 	<dependencies>
-		<nextcloud min-version="28" max-version="31" />
+		<nextcloud min-version="30" max-version="34" />
 	</dependencies>
 	<settings>
 		<personal>OCA\S3Api\Settings\Personal</personal>
