@@ -8,6 +8,7 @@ use OCA\S3Api\Db\BucketMapper;
 use OCA\S3Api\Service\BucketService;
 use OCA\S3Api\Service\S3AuthException;
 use OCA\S3Api\Service\S3AuthService;
+use OCA\S3Api\Service\S3RequestBody;
 use OCA\S3Api\Service\S3ResponseBuilder;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
@@ -31,6 +32,7 @@ class S3Controller extends Controller {
 		private BucketService $bucketService,
 		private BucketMapper $bucketMapper,
 		private S3ResponseBuilder $responseBuilder,
+		private S3RequestBody $requestBody,
 		private IRootFolder $rootFolder,
 	) {
 		parent::__construct($appName, $request);
@@ -70,7 +72,7 @@ class S3Controller extends Controller {
 		try {
 			$auth = $this->authService->authenticate($this->request);
 		} catch (S3AuthException $e) {
-			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, Http::STATUS_FORBIDDEN);
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
 		}
 
 		$userId = $auth['userId'];
@@ -214,7 +216,7 @@ class S3Controller extends Controller {
 			return $this->errorResponse('AccessDenied', 'Write access denied', '/' . $bucketName . '/' . $objectKey, Http::STATUS_FORBIDDEN);
 		}
 
-		$content = file_get_contents('php://input');
+		$resource = '/' . $bucketName . '/' . $objectKey;
 
 		// Create subdirectories if needed
 		$dir = dirname($objectKey);
@@ -228,7 +230,7 @@ class S3Controller extends Controller {
 				try {
 					$sub = $targetFolder->get($part);
 					if (!($sub instanceof Folder)) {
-						return $this->errorResponse('InvalidArgument', 'Path component is not a directory', '/' . $bucketName . '/' . $objectKey, Http::STATUS_CONFLICT);
+						return $this->errorResponse('InvalidArgument', 'Path component is not a directory', $resource, Http::STATUS_CONFLICT);
 					}
 					$targetFolder = $sub;
 				} catch (NotFoundException) {
@@ -238,21 +240,137 @@ class S3Controller extends Controller {
 		}
 
 		$fileName = basename($objectKey);
+
+		$existing = null;
 		try {
-			$file = $targetFolder->get($fileName);
-			if ($file instanceof File) {
-				$file->putContent($content);
-			} else {
-				return $this->errorResponse('InvalidArgument', 'Target exists and is not a file', '/' . $bucketName . '/' . $objectKey, Http::STATUS_CONFLICT);
+			$existing = $targetFolder->get($fileName);
+			if (!($existing instanceof File)) {
+				return $this->errorResponse('InvalidArgument', 'Target exists and is not a file', $resource, Http::STATUS_CONFLICT);
 			}
 		} catch (NotFoundException) {
-			$file = $targetFolder->newFile($fileName, $content);
+			// New object.
 		}
+
+		// Conditional write (the compare-and-swap S3 clients rely on) must be
+		// evaluated against the state we are about to overwrite.
+		$precondition = $this->checkWritePreconditions($existing, $resource);
+		if ($precondition !== null) {
+			return $precondition;
+		}
+
+		// Decode the body before writing: AWS SDKs frame streaming uploads with
+		// `aws-chunked`, and storing that framing verbatim corrupts the object.
+		$sha256 = null;
+		try {
+			$stream = $this->requestBody->toStream($this->request, $sha256);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		}
+
+		// Verify the payload hash when the client committed to a literal one.
+		$declaredHash = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
+		if ($declaredHash !== '' && ctype_xdigit($declaredHash) && strlen($declaredHash) === 64
+			&& !hash_equals($declaredHash, (string)$sha256)) {
+			fclose($stream);
+			return $this->errorResponse(
+				'XAmzContentSHA256Mismatch',
+				'The provided x-amz-content-sha256 does not match what was computed',
+				$resource,
+				Http::STATUS_BAD_REQUEST,
+			);
+		}
+
+		try {
+			if ($existing instanceof File) {
+				$file = $existing;
+				$target = $file->fopen('wb');
+				if ($target === false) {
+					return $this->errorResponse('InternalError', 'Cannot open object for writing', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
+				}
+				stream_copy_to_stream($stream, $target);
+				fclose($target);
+			} else {
+				$file = $targetFolder->newFile($fileName);
+				$target = $file->fopen('wb');
+				if ($target === false) {
+					return $this->errorResponse('InternalError', 'Cannot open object for writing', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
+				}
+				stream_copy_to_stream($stream, $target);
+				fclose($target);
+			}
+		} finally {
+			fclose($stream);
+		}
+
+		// Re-read metadata so the ETag reflects what we just stored.
+		$file = $targetFolder->get($fileName);
 
 		$response = new DataDisplayResponse('');
 		$response->setStatus(Http::STATUS_OK);
 		$response->addHeader('ETag', '"' . $file->getEtag() . '"');
 		return $response;
+	}
+
+	/**
+	 * Evaluate `If-None-Match` / `If-Match` on a write.
+	 *
+	 * This is what makes the store usable for compare-and-swap: `If-None-Match: *`
+	 * means "create only", `If-Match: <etag>` means "replace exactly this
+	 * version". Returning 200 regardless would make clients believe a lost
+	 * update succeeded.
+	 *
+	 * @return Response|null a 412 response, or null when the write may proceed
+	 */
+	private function checkWritePreconditions(?File $existing, string $resource): ?Response {
+		$ifNoneMatch = trim((string)$this->request->getHeader('If-None-Match'));
+		$ifMatch = trim((string)$this->request->getHeader('If-Match'));
+
+		if ($ifMatch !== '') {
+			if ($existing === null) {
+				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
+			}
+			if (!$this->etagMatches($ifMatch, $existing->getEtag())) {
+				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
+			}
+		}
+
+		if ($ifNoneMatch !== '') {
+			if ($ifNoneMatch === '*') {
+				if ($existing !== null) {
+					return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
+				}
+			} elseif ($existing !== null && $this->etagMatches($ifNoneMatch, $existing->getEtag())) {
+				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Whether an `If-Match` / `If-None-Match` header value matches an ETag.
+	 *
+	 * Accepts `*`, comma-separated lists, quoted and unquoted forms, and the
+	 * `W/` weak prefix.
+	 */
+	private function etagMatches(string $header, string $etag): bool {
+		if (trim($header) === '*') {
+			return true;
+		}
+
+		$etag = trim($etag, '"');
+		foreach (explode(',', $header) as $candidate) {
+			$candidate = trim($candidate);
+			if (str_starts_with($candidate, 'W/')) {
+				$candidate = substr($candidate, 2);
+			}
+			$candidate = trim($candidate, '"');
+			if ($candidate !== '' && hash_equals($etag, $candidate)) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	private function deleteObject(Folder $bucketFolder, string $objectKey, string $bucketName, string $permission): Response {
