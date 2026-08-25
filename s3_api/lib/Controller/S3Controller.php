@@ -8,6 +8,7 @@ use OCA\S3Api\Db\BucketMapper;
 use OCA\S3Api\Http\S3ObjectResponse;
 use OCA\S3Api\Service\BucketService;
 use OCA\S3Api\Service\MultipartService;
+use OCA\S3Api\Service\ObjectLockService;
 use OCA\S3Api\Service\S3AuthException;
 use OCA\S3Api\Service\S3AuthService;
 use OCA\S3Api\Service\S3RequestBody;
@@ -38,6 +39,7 @@ class S3Controller extends Controller {
 		private S3ResponseBuilder $responseBuilder,
 		private S3RequestBody $requestBody,
 		private MultipartService $multipartService,
+		private ObjectLockService $objectLock,
 		private IRootFolder $rootFolder,
 		private LoggerInterface $logger,
 	) {
@@ -284,7 +286,7 @@ class S3Controller extends Controller {
 			// CopyObject is a PUT that names a source instead of sending a body.
 			// Treating it as a plain PUT would truncate the target to nothing.
 			$method === 'PUT' && $copySource !== '' => $this->copyObject($bucketFolder, $bucketName, $objectKey, $copySource, $permission),
-			$method === 'PUT' => $this->putObject($bucketFolder, $objectKey, $bucketName, $permission),
+			$method === 'PUT' => $this->putObject($bucket, $bucketFolder, $objectKey, $bucketName, $permission),
 			$method === 'DELETE' => $this->deleteObject($bucketFolder, $objectKey, $bucketName, $permission),
 			default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
 		};
@@ -521,55 +523,19 @@ class S3Controller extends Controller {
 		return [$start, $end];
 	}
 
-	private function putObject(Folder $bucketFolder, string $objectKey, string $bucketName, string $permission): Response {
+	private function putObject($bucket, Folder $bucketFolder, string $objectKey, string $bucketName, string $permission): Response {
 		if ($permission !== 'readwrite') {
 			return $this->errorResponse('AccessDenied', 'Write access denied', '/' . $bucketName . '/' . $objectKey, Http::STATUS_FORBIDDEN);
 		}
 
 		$resource = '/' . $bucketName . '/' . $objectKey;
 
-		// Create subdirectories if needed
-		$dir = dirname($objectKey);
-		$targetFolder = $bucketFolder;
-		if ($dir !== '' && $dir !== '.') {
-			$parts = explode('/', $dir);
-			foreach ($parts as $part) {
-				if ($part === '' || $part === '.') {
-					continue;
-				}
-				try {
-					$sub = $targetFolder->get($part);
-					if (!($sub instanceof Folder)) {
-						return $this->errorResponse('InvalidArgument', 'Path component is not a directory', $resource, Http::STATUS_CONFLICT);
-					}
-					$targetFolder = $sub;
-				} catch (NotFoundException) {
-					$targetFolder = $targetFolder->newFolder($part);
-				}
-			}
-		}
+		$ifMatch = trim((string)$this->request->getHeader('If-Match'));
+		$ifNoneMatch = trim((string)$this->request->getHeader('If-None-Match'));
+		$conditional = $ifMatch !== '' || $ifNoneMatch !== '';
 
-		$fileName = basename($objectKey);
-
-		$existing = null;
-		try {
-			$existing = $targetFolder->get($fileName);
-			if (!($existing instanceof File)) {
-				return $this->errorResponse('InvalidArgument', 'Target exists and is not a file', $resource, Http::STATUS_CONFLICT);
-			}
-		} catch (NotFoundException) {
-			// New object.
-		}
-
-		// Conditional write (the compare-and-swap S3 clients rely on) must be
-		// evaluated against the state we are about to overwrite.
-		$precondition = $this->checkWritePreconditions($existing, $resource);
-		if ($precondition !== null) {
-			return $precondition;
-		}
-
-		// Decode the body before writing: AWS SDKs frame streaming uploads with
-		// `aws-chunked`, and storing that framing verbatim corrupts the object.
+		// Read the body before taking the lock: the upload can take a while and
+		// nothing about it depends on the object's current state.
 		$sha256 = null;
 		try {
 			$stream = $this->requestBody->toStream($this->request, $sha256);
@@ -577,17 +543,82 @@ class S3Controller extends Controller {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		}
 
-		// Verify the payload hash when the client committed to a literal one.
-		$declaredHash = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
-		if ($declaredHash !== '' && ctype_xdigit($declaredHash) && strlen($declaredHash) === 64
-			&& !hash_equals($declaredHash, (string)$sha256)) {
-			fclose($stream);
-			return $this->errorResponse(
-				'XAmzContentSHA256Mismatch',
-				'The provided x-amz-content-sha256 does not match what was computed',
+		try {
+			// Verify the payload hash when the client committed to a literal one.
+			$declaredHash = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
+			if ($declaredHash !== '' && ctype_xdigit($declaredHash) && strlen($declaredHash) === 64
+				&& !hash_equals($declaredHash, (string)$sha256)) {
+				return $this->errorResponse(
+					'XAmzContentSHA256Mismatch',
+					'The provided x-amz-content-sha256 does not match what was computed',
+					$resource,
+					Http::STATUS_BAD_REQUEST,
+				);
+			}
+
+			$write = fn(): Response => $this->writeObject(
+				$bucketFolder,
+				$objectKey,
 				$resource,
-				Http::STATUS_BAD_REQUEST,
+				$stream,
+				$ifMatch,
+				$ifNoneMatch,
 			);
+
+			if (!$conditional) {
+				return $write();
+			}
+
+			// A conditional write must evaluate the precondition and store the
+			// body without anything else touching the key in between, or two
+			// concurrent `If-None-Match: *` requests both see "absent" and both
+			// succeed -- a silently lost update for a client using this for
+			// compare-and-swap.
+			return $this->objectLock->withLock($bucket->getId(), $objectKey, $write);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		} catch (LockedException) {
+			return $this->errorResponse('SlowDown', 'The object is locked by another operation, please retry', $resource, Http::STATUS_SERVICE_UNAVAILABLE);
+		} finally {
+			if (is_resource($stream)) {
+				fclose($stream);
+			}
+		}
+	}
+
+	/**
+	 * Evaluate the preconditions and store the body.
+	 *
+	 * Called with the object lock held for conditional writes, so the lookup and
+	 * the write are one step.
+	 *
+	 * @param resource $stream
+	 */
+	private function writeObject(
+		Folder $bucketFolder,
+		string $objectKey,
+		string $resource,
+		$stream,
+		string $ifMatch,
+		string $ifNoneMatch,
+	): Response {
+		$targetFolder = $this->ensureParentFolder($bucketFolder, $objectKey);
+		$fileName = basename($objectKey);
+
+		$existing = null;
+		try {
+			$existing = $targetFolder->get($fileName);
+		} catch (NotFoundException) {
+			// New object.
+		}
+
+		if ($existing !== null && !($existing instanceof File)) {
+			return $this->errorResponse('InvalidArgument', 'Target exists and is not a file', $resource, Http::STATUS_CONFLICT);
+		}
+
+		$precondition = $this->checkWritePreconditions($existing, $resource, $ifMatch, $ifNoneMatch);
+		if ($precondition !== null) {
+			return $precondition;
 		}
 
 		// Hand the stream to Nextcloud rather than writing through fopen():
@@ -595,20 +626,10 @@ class S3Controller extends Controller {
 		// cache, so size and ETag reflect the new content. Writing to the raw
 		// handle leaves stale metadata behind, which breaks ETag-based
 		// conditional requests.
-		try {
-			if ($existing instanceof File) {
-				$existing->putContent($stream);
-			} else {
-				$targetFolder->newFile($fileName, $stream);
-			}
-		} catch (LockedException) {
-			return $this->errorResponse('SlowDown', 'The object is locked by another operation, please retry', $resource, Http::STATUS_SERVICE_UNAVAILABLE);
-		} finally {
-			// putContent()/newFile() close the stream themselves; guard against
-			// the paths that do not.
-			if (is_resource($stream)) {
-				fclose($stream);
-			}
+		if ($existing instanceof File) {
+			$existing->putContent($stream);
+		} else {
+			$targetFolder->newFile($fileName, $stream);
 		}
 
 		// Re-read the node so the ETag is the one now stored.
@@ -633,10 +654,7 @@ class S3Controller extends Controller {
 	 *
 	 * @return Response|null a 412 response, or null when the write may proceed
 	 */
-	private function checkWritePreconditions(?File $existing, string $resource): ?Response {
-		$ifNoneMatch = trim((string)$this->request->getHeader('If-None-Match'));
-		$ifMatch = trim((string)$this->request->getHeader('If-Match'));
-
+	private function checkWritePreconditions(?File $existing, string $resource, string $ifMatch, string $ifNoneMatch): ?Response {
 		if ($ifMatch !== '') {
 			if ($existing === null) {
 				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
