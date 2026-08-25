@@ -35,6 +35,7 @@ class S3ObjectResponse extends Response implements ICallbackResponse {
 	 */
 	public function __construct(
 		private File $file,
+		string $etag,
 		private bool $includeBody = true,
 		private ?int $rangeStart = null,
 		private ?int $rangeEnd = null,
@@ -50,7 +51,7 @@ class S3ObjectResponse extends Response implements ICallbackResponse {
 
 		$this->addHeader('Content-Type', $file->getMimeType());
 		$this->addHeader('Content-Length', (string)$length);
-		$this->addHeader('ETag', '"' . $file->getEtag() . '"');
+		$this->addHeader('ETag', '"' . $etag . '"');
 		$this->addHeader('Last-Modified', gmdate('D, d M Y H:i:s \G\M\T', $file->getMTime()));
 		$this->addHeader('Accept-Ranges', 'bytes');
 

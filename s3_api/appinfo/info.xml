@@ -9,7 +9,7 @@ This app exposes Nextcloud folders as S3-compatible buckets.
 Users can mark folders as buckets in their personal settings and create API keys (readonly/readwrite) per bucket.
 The API is accessible via path-style S3 requests and supports AWS Signature V4 authentication.
 	]]></description>
-	<version>1.2.0</version>
+	<version>1.3.0</version>
 	<licence>agpl</licence>
 	<author>osuv</author>
 	<namespace>S3Api</namespace>

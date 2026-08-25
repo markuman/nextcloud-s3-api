@@ -7,6 +7,7 @@ namespace OCA\S3Api\Controller;
 use OCA\S3Api\Db\BucketMapper;
 use OCA\S3Api\Http\S3ObjectResponse;
 use OCA\S3Api\Service\BucketService;
+use OCA\S3Api\Service\EtagService;
 use OCA\S3Api\Service\MultipartService;
 use OCA\S3Api\Service\ObjectLockService;
 use OCA\S3Api\Service\S3AuthException;
@@ -38,6 +39,7 @@ class S3Controller extends Controller {
 		private BucketMapper $bucketMapper,
 		private S3ResponseBuilder $responseBuilder,
 		private S3RequestBody $requestBody,
+		private EtagService $etagService,
 		private MultipartService $multipartService,
 		private ObjectLockService $objectLock,
 		private IRootFolder $rootFolder,
@@ -418,7 +420,7 @@ class S3Controller extends Controller {
 			return $this->errorResponse('NoSuchKey', 'The specified key is not a file', $resource, Http::STATUS_NOT_FOUND, $includeBody);
 		}
 
-		$etag = $node->getEtag();
+		$etag = $this->etagService->get($node);
 
 		// RFC 9110: If-Match is evaluated before If-None-Match.
 		$ifMatch = trim((string)$this->request->getHeader('If-Match'));
@@ -446,10 +448,10 @@ class S3Controller extends Controller {
 		}
 
 		if ($range === null) {
-			return new S3ObjectResponse($node, $includeBody);
+			return new S3ObjectResponse($node, $etag, $includeBody);
 		}
 
-		return new S3ObjectResponse($node, $includeBody, $range[0], $range[1]);
+		return new S3ObjectResponse($node, $etag, $includeBody, $range[0], $range[1]);
 	}
 
 	/**
@@ -632,7 +634,7 @@ class S3Controller extends Controller {
 			$targetFolder->newFile($fileName, $stream);
 		}
 
-		// Re-read the node so the ETag is the one now stored.
+		// Re-read the node so the ETag is derived from what is now stored.
 		$file = $targetFolder->get($fileName);
 		if (!($file instanceof File)) {
 			return $this->errorResponse('InternalError', 'Object vanished after write', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
@@ -640,7 +642,7 @@ class S3Controller extends Controller {
 
 		$response = new DataDisplayResponse('');
 		$response->setStatus(Http::STATUS_OK);
-		$response->addHeader('ETag', '"' . $file->getEtag() . '"');
+		$response->addHeader('ETag', '"' . $this->etagService->refresh($file) . '"');
 		return $response;
 	}
 
@@ -659,7 +661,7 @@ class S3Controller extends Controller {
 			if ($existing === null) {
 				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
 			}
-			if (!$this->etagMatches($ifMatch, $existing->getEtag())) {
+			if (!$this->etagMatches($ifMatch, $this->etagService->get($existing))) {
 				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
 			}
 		}
@@ -669,7 +671,7 @@ class S3Controller extends Controller {
 				if ($existing !== null) {
 					return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
 				}
-			} elseif ($existing !== null && $this->etagMatches($ifNoneMatch, $existing->getEtag())) {
+			} elseif ($existing !== null && $this->etagMatches($ifNoneMatch, $this->etagService->get($existing))) {
 				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
 			}
 		}
@@ -710,7 +712,11 @@ class S3Controller extends Controller {
 
 		try {
 			$node = $bucketFolder->get($objectKey);
+			$fileId = $node->getId();
 			$node->delete();
+			// Drop the recorded ETag: file ids are reused, so a stale row would
+			// otherwise be served for a different object.
+			$this->etagService->forget($fileId);
 		} catch (NotFoundException) {
 			// S3 returns 204 even if object doesn't exist
 		}
@@ -822,6 +828,11 @@ class S3Controller extends Controller {
 				$requested,
 				fn($assembled) => $this->writeAssembledObject($bucketFolder, $objectKey, $assembled),
 			);
+
+			// Record the compound ETag, otherwise the next read would replace it
+			// with a plain content hash and the value would change without the
+			// object changing.
+			$this->etagService->set($result['file'], $result['etag']);
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		} catch (LockedException) {
@@ -1000,7 +1011,7 @@ class S3Controller extends Controller {
 
 		if ($sourceKey === $objectKey) {
 			// A self-copy would truncate the source before reading it.
-			return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($source->getEtag(), $source->getMTime()));
+			return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($this->etagService->get($source), $source->getMTime()));
 		}
 
 		$handle = $source->fopen('rb');
@@ -1016,7 +1027,7 @@ class S3Controller extends Controller {
 			}
 		}
 
-		return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($file->getEtag(), $file->getMTime()));
+		return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($this->etagService->refresh($file), $file->getMTime()));
 	}
 
 	/**
@@ -1230,7 +1241,9 @@ class S3Controller extends Controller {
 
 			try {
 				$node = $bucketFolder->get($key);
+				$fileId = $node->getId();
 				$node->delete();
+				$this->etagService->forget($fileId);
 				$deleted[] = $key;
 			} catch (NotFoundException) {
 				// Deleting a missing key is a success in S3.

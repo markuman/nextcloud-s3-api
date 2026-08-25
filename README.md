@@ -139,9 +139,6 @@ takes leases during maintenance.
 
 ### Caveats
 
-- **One writer.** Conditional writes are checked and applied without holding a
-  lock across both steps, so two walgit instances pushing to the same bucket at
-  the same instant can both win a `Create`. A single instance is safe.
 - **Throughput.** Every request goes through PHP and Nextcloud's storage layer.
   Fine for ordinary repositories; not a substitute for a real object store in
   front of a large monorepo.
@@ -180,10 +177,14 @@ otherwise be handled as an operation on the object itself.
 
 ### Semantics worth knowing
 
-- **ETags** are Nextcloud's own etags, not content MD5. They change whenever the
-  content changes and are stable across `GET`, `HEAD`, `PUT` and listings, which
-  is what conditional requests need, but do not compute them client-side. For
-  multipart objects the usual `<md5>-<parts>` form is returned.
+- **ETags** are an MD5 of the object's content, as S3 reports for single-part
+  uploads; multipart objects use the compound `<md5-of-part-md5s>-<parts>` form.
+  Nextcloud's own etag is deliberately *not* used: it is
+  `md5(mtime + inode + dev + size)`, and because mtime has one-second
+  resolution, two writes of equally sized but different content within the same
+  second share an etag — enough to make a compare-and-swap accept a lost update.
+  Objects written outside this API (web UI, WebDAV, sync client) get an ETag on
+  first read.
 - **Conditional writes** return `412 PreconditionFailed`. `If-None-Match: *`
   means create-only; `If-Match: <etag>` means replace exactly that version.
 - **Streaming.** Bodies are decoded and written as a stream, so uploads are not

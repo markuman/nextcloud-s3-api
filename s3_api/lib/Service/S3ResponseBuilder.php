@@ -14,6 +14,11 @@ class S3ResponseBuilder {
 	/** S3 never returns more than this, whatever the client asks for. */
 	private const MAX_KEYS_LIMIT = 1000;
 
+	public function __construct(
+		private EtagService $etagService,
+	) {
+	}
+
 	public function listBucketsXml(string $userId, array $buckets): string {
 		$xml = '<?xml version="1.0" encoding="UTF-8"?>';
 		$xml .= '<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
@@ -404,7 +409,7 @@ class S3ResponseBuilder {
 			$objects[] = [
 				'key' => $key,
 				'lastModified' => gmdate('Y-m-d\TH:i:s.000\Z', $node->getMTime()),
-				'etag' => $node->getEtag(),
+				'etag' => $this->etagService->get($node),
 				'size' => $node->getSize(),
 			];
 
