@@ -25,6 +25,7 @@ use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
 use OCP\IRequest;
 use OCP\Lock\LockedException;
+use Psr\Log\LoggerInterface;
 
 class S3Controller extends Controller {
 
@@ -38,6 +39,7 @@ class S3Controller extends Controller {
 		private S3RequestBody $requestBody,
 		private MultipartService $multipartService,
 		private IRootFolder $rootFolder,
+		private LoggerInterface $logger,
 	) {
 		parent::__construct($appName, $request);
 	}
@@ -85,7 +87,24 @@ class S3Controller extends Controller {
 	}
 
 	private function handleRequest(string $path = ''): Response {
-		$response = $this->dispatch($path);
+		try {
+			$response = $this->dispatch($path);
+		} catch (S3AuthException $e) {
+			$response = $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
+		} catch (LockedException) {
+			// Nextcloud's locking surfaces as 423, which S3 clients treat as a
+			// permanent failure. 503 is the retryable equivalent.
+			$response = $this->errorResponse('SlowDown', 'The resource is locked, please retry', '/' . $path, Http::STATUS_SERVICE_UNAVAILABLE);
+		} catch (\Throwable $e) {
+			// Without this the framework renders an HTML error page, which no S3
+			// client can parse, and the failure looks like a protocol error
+			// rather than a server fault.
+			$this->logger->error('Unhandled error serving S3 request', [
+				'app' => 's3_api',
+				'exception' => $e,
+			]);
+			$response = $this->errorResponse('InternalError', 'We encountered an internal error, please try again', '/' . $path, Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
 
 		// A response to HEAD must not carry a body. Error paths build XML
 		// bodies, so strip them centrally instead of relying on every caller.
