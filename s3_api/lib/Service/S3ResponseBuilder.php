@@ -207,6 +207,24 @@ class S3ResponseBuilder {
 		return $xml;
 	}
 
+	public function copyObjectResultXml(string $etag, int $mtime): string {
+		$xml = '<?xml version="1.0" encoding="UTF-8"?>';
+		$xml .= '<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
+		$xml .= '<LastModified>' . gmdate('Y-m-d\TH:i:s.000\Z', $mtime) . '</LastModified>';
+		$xml .= '<ETag>"' . $this->escape($etag) . '"</ETag>';
+		$xml .= '</CopyObjectResult>';
+		return $xml;
+	}
+
+	public function copyPartResultXml(string $etag, int $mtime): string {
+		$xml = '<?xml version="1.0" encoding="UTF-8"?>';
+		$xml .= '<CopyPartResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
+		$xml .= '<LastModified>' . gmdate('Y-m-d\TH:i:s.000\Z', $mtime) . '</LastModified>';
+		$xml .= '<ETag>"' . $this->escape($etag) . '"</ETag>';
+		$xml .= '</CopyPartResult>';
+		return $xml;
+	}
+
 	public function locationXml(): string {
 		return '<?xml version="1.0" encoding="UTF-8"?>'
 			. '<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>';

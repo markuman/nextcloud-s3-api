@@ -256,13 +256,17 @@ class S3Controller extends Controller {
 		if ($uploadId !== null) {
 			$partNumber = $query['partNumber'] ?? null;
 
-			return match ($method) {
-				'PUT' => $partNumber !== null
-					? $this->uploadPart($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $partNumber, $permission)
-					: $this->errorResponse('InvalidRequest', 'partNumber is required', $resource, Http::STATUS_BAD_REQUEST),
-				'POST' => $this->completeMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
-				'DELETE' => $this->abortMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
-				'GET' => $this->listParts($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId),
+			$copySource = trim((string)$this->request->getHeader('x-amz-copy-source'));
+
+			return match (true) {
+				$method === 'PUT' && $partNumber === null => $this->errorResponse('InvalidRequest', 'partNumber is required', $resource, Http::STATUS_BAD_REQUEST),
+				// UploadPartCopy: a part sourced from another object rather than
+				// from the request body.
+				$method === 'PUT' && $copySource !== '' => $this->uploadPartCopy($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $partNumber, $copySource, $permission),
+				$method === 'PUT' => $this->uploadPart($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $partNumber, $permission),
+				$method === 'POST' => $this->completeMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
+				$method === 'DELETE' => $this->abortMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
+				$method === 'GET' => $this->listParts($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId),
 				default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
 			};
 		}
@@ -272,11 +276,16 @@ class S3Controller extends Controller {
 			return $unsupported;
 		}
 
-		return match ($method) {
-			'GET' => $this->getObject($bucketFolder, $objectKey, $bucketName),
-			'HEAD' => $this->headObject($bucketFolder, $objectKey, $bucketName),
-			'PUT' => $this->putObject($bucketFolder, $objectKey, $bucketName, $permission),
-			'DELETE' => $this->deleteObject($bucketFolder, $objectKey, $bucketName, $permission),
+		$copySource = trim((string)$this->request->getHeader('x-amz-copy-source'));
+
+		return match (true) {
+			$method === 'GET' => $this->getObject($bucketFolder, $objectKey, $bucketName),
+			$method === 'HEAD' => $this->headObject($bucketFolder, $objectKey, $bucketName),
+			// CopyObject is a PUT that names a source instead of sending a body.
+			// Treating it as a plain PUT would truncate the target to nothing.
+			$method === 'PUT' && $copySource !== '' => $this->copyObject($bucketFolder, $bucketName, $objectKey, $copySource, $permission),
+			$method === 'PUT' => $this->putObject($bucketFolder, $objectKey, $bucketName, $permission),
+			$method === 'DELETE' => $this->deleteObject($bucketFolder, $objectKey, $bucketName, $permission),
 			default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
 		};
 	}
@@ -870,19 +879,32 @@ class S3Controller extends Controller {
 		$targetFolder = $this->ensureParentFolder($bucketFolder, $objectKey);
 		$fileName = basename($objectKey);
 
+		// Resolve first, write second: wrapping the write in the same try as the
+		// lookup would catch a NotFoundException raised by putContent() and
+		// retry it as a create against a file that already exists.
+		$existing = null;
 		try {
 			$existing = $targetFolder->get($fileName);
-			if (!($existing instanceof File)) {
-				throw new S3AuthException('InvalidArgument', 'Target exists and is not a file', Http::STATUS_CONFLICT);
-			}
-			$existing->putContent($assembled);
-			$file = $existing;
 		} catch (NotFoundException) {
-			$file = $targetFolder->newFile($fileName, $assembled);
+			// Creating a new object.
+		}
+
+		if ($existing !== null && !($existing instanceof File)) {
+			throw new S3AuthException('InvalidArgument', 'Target exists and is not a file', Http::STATUS_CONFLICT);
+		}
+
+		if ($existing instanceof File) {
+			$existing->putContent($assembled);
+		} else {
+			$targetFolder->newFile($fileName, $assembled);
 		}
 
 		$reread = $targetFolder->get($fileName);
-		return $reread instanceof File ? $reread : $file;
+		if (!($reread instanceof File)) {
+			throw new S3AuthException('InternalError', 'Object vanished after write', Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
+
+		return $reread;
 	}
 
 	/**
@@ -923,6 +945,237 @@ class S3Controller extends Controller {
 		}
 
 		return $parts === [] ? null : $parts;
+	}
+
+	// ---- copy -------------------------------------------------------------
+
+	/**
+	 * CopyObject: server-side copy from `x-amz-copy-source`.
+	 */
+	private function copyObject(
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $copySource,
+		string $permission,
+	): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
+		}
+
+		$sourceKey = $this->parseCopySource($copySource, $bucketName);
+		if ($sourceKey === null) {
+			return $this->errorResponse('InvalidArgument', 'Malformed or cross-bucket x-amz-copy-source', $resource, Http::STATUS_BAD_REQUEST);
+		}
+
+		try {
+			$source = $bucketFolder->get($sourceKey);
+		} catch (NotFoundException) {
+			return $this->errorResponse('NoSuchKey', 'The specified copy source does not exist', $resource, Http::STATUS_NOT_FOUND);
+		}
+
+		if (!($source instanceof File)) {
+			return $this->errorResponse('NoSuchKey', 'The copy source is not a file', $resource, Http::STATUS_NOT_FOUND);
+		}
+
+		if ($sourceKey === $objectKey) {
+			// A self-copy would truncate the source before reading it.
+			return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($source->getEtag(), $source->getMTime()));
+		}
+
+		$handle = $source->fopen('rb');
+		if ($handle === false) {
+			return $this->errorResponse('InternalError', 'Cannot read copy source', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
+
+		try {
+			$file = $this->writeAssembledObject($bucketFolder, $objectKey, $handle);
+		} finally {
+			if (is_resource($handle)) {
+				fclose($handle);
+			}
+		}
+
+		return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($file->getEtag(), $file->getMTime()));
+	}
+
+	/**
+	 * UploadPartCopy: a part whose bytes come from another object, optionally a
+	 * byte range of it. This is how clients concatenate objects server-side.
+	 */
+	private function uploadPartCopy(
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $uploadId,
+		string $partNumber,
+		string $copySource,
+		string $permission,
+	): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
+		}
+
+		if (!ctype_digit($partNumber)) {
+			return $this->errorResponse('InvalidArgument', 'partNumber must be a number', $resource, Http::STATUS_BAD_REQUEST);
+		}
+
+		$sourceKey = $this->parseCopySource($copySource, $bucketName);
+		if ($sourceKey === null) {
+			return $this->errorResponse('InvalidArgument', 'Malformed or cross-bucket x-amz-copy-source', $resource, Http::STATUS_BAD_REQUEST);
+		}
+
+		try {
+			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
+
+			$source = $bucketFolder->get($sourceKey);
+			if (!($source instanceof File)) {
+				return $this->errorResponse('NoSuchKey', 'The copy source is not a file', $resource, Http::STATUS_NOT_FOUND);
+			}
+
+			$size = $source->getSize();
+			$range = $this->parseCopySourceRange(
+				trim((string)$this->request->getHeader('x-amz-copy-source-range')),
+				$size,
+			);
+			if ($range === false) {
+				return $this->errorResponse('InvalidArgument', 'The x-amz-copy-source-range is not satisfiable', $resource, Http::STATUS_BAD_REQUEST);
+			}
+
+			$slice = $this->sliceOf($source, $range);
+			try {
+				$etag = $this->multipartService->putPart($bucketFolder, $uploadId, (int)$partNumber, $slice);
+			} finally {
+				if (is_resource($slice)) {
+					fclose($slice);
+				}
+			}
+		} catch (NotFoundException) {
+			return $this->errorResponse('NoSuchKey', 'The specified copy source does not exist', $resource, Http::STATUS_NOT_FOUND);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		}
+
+		return $this->xmlResponse($this->responseBuilder->copyPartResultXml($etag, time()));
+	}
+
+	/**
+	 * Extract the key from `x-amz-copy-source`.
+	 *
+	 * The value is `/bucket/key` or `bucket/key`, percent-encoded, and may
+	 * carry a `?versionId=` suffix. Only copies inside the authorised bucket
+	 * are allowed, since credentials are scoped to one bucket.
+	 */
+	private function parseCopySource(string $copySource, string $bucketName): ?string {
+		$value = ltrim($copySource, '/');
+
+		$question = strpos($value, '?');
+		if ($question !== false) {
+			$value = substr($value, 0, $question);
+		}
+
+		$slash = strpos($value, '/');
+		if ($slash === false) {
+			return null;
+		}
+
+		$sourceBucket = rawurldecode(substr($value, 0, $slash));
+		if ($sourceBucket !== $bucketName) {
+			return null;
+		}
+
+		$key = rawurldecode(substr($value, $slash + 1));
+		if ($key === '' || str_contains($key, '..')) {
+			return null;
+		}
+
+		return $key;
+	}
+
+	/**
+	 * @return array{0: int, 1: int}|null|false null for the whole object, false
+	 *         when the range cannot be satisfied
+	 */
+	private function parseCopySourceRange(string $header, int $size): array|null|false {
+		if ($header === '') {
+			return null;
+		}
+
+		if (!str_starts_with($header, 'bytes=')) {
+			return false;
+		}
+
+		$spec = substr($header, 6);
+		$dash = strpos($spec, '-');
+		if ($dash === false) {
+			return false;
+		}
+
+		$fromRaw = trim(substr($spec, 0, $dash));
+		$toRaw = trim(substr($spec, $dash + 1));
+
+		// Unlike Range, a copy-source range must be fully specified.
+		if (!ctype_digit($fromRaw) || !ctype_digit($toRaw)) {
+			return false;
+		}
+
+		$start = (int)$fromRaw;
+		$end = (int)$toRaw;
+
+		if ($start > $end || $start >= $size || $end >= $size) {
+			return false;
+		}
+
+		return [$start, $end];
+	}
+
+	/**
+	 * A stream over `$range` of `$file`, or the whole file when null.
+	 *
+	 * @param array{0: int, 1: int}|null $range
+	 * @return resource
+	 */
+	private function sliceOf(File $file, ?array $range) {
+		$handle = $file->fopen('rb');
+		if ($handle === false) {
+			throw new S3AuthException('InternalError', 'Cannot read copy source', Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
+
+		if ($range === null) {
+			return $handle;
+		}
+
+		$out = fopen('php://temp/maxmemory:' . (8 * 1024 * 1024), 'w+b');
+		if ($out === false) {
+			fclose($handle);
+			throw new S3AuthException('InternalError', 'Cannot buffer copy source', Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
+
+		try {
+			if ($range[0] > 0) {
+				fseek($handle, $range[0]);
+			}
+
+			$remaining = $range[1] - $range[0] + 1;
+			while ($remaining > 0 && !feof($handle)) {
+				$buf = fread($handle, (int)min(1024 * 1024, $remaining));
+				if ($buf === false || $buf === '') {
+					break;
+				}
+				fwrite($out, $buf);
+				$remaining -= strlen($buf);
+			}
+		} finally {
+			fclose($handle);
+		}
+
+		rewind($out);
+		return $out;
 	}
 
 	// ---- bulk delete ------------------------------------------------------
