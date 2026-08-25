@@ -8,8 +8,11 @@ return [
 		['name' => 's3#listBucketsOrRoot', 'url' => '/s3', 'verb' => 'GET'],
 		['name' => 's3#handleGet', 'url' => '/s3/{path}', 'verb' => 'GET', 'requirements' => ['path' => '.+']],
 		['name' => 's3#handlePut', 'url' => '/s3/{path}', 'verb' => 'PUT', 'requirements' => ['path' => '.+']],
+		// POST carries the multipart upload and bulk delete subresources.
+		['name' => 's3#handlePost', 'url' => '/s3/{path}', 'verb' => 'POST', 'requirements' => ['path' => '.+']],
 		['name' => 's3#handleDelete', 'url' => '/s3/{path}', 'verb' => 'DELETE', 'requirements' => ['path' => '.+']],
 		['name' => 's3#handleHead', 'url' => '/s3/{path}', 'verb' => 'HEAD', 'requirements' => ['path' => '.+']],
+		['name' => 's3#handleHeadRoot', 'url' => '/s3', 'verb' => 'HEAD'],
 
 		// Settings API (authenticated, CSRF-protected)
 		['name' => 'settings_api#listBuckets', 'url' => '/api/v1/buckets', 'verb' => 'GET'],

@@ -7,6 +7,7 @@ namespace OCA\S3Api\Controller;
 use OCA\S3Api\Db\BucketMapper;
 use OCA\S3Api\Http\S3ObjectResponse;
 use OCA\S3Api\Service\BucketService;
+use OCA\S3Api\Service\MultipartService;
 use OCA\S3Api\Service\S3AuthException;
 use OCA\S3Api\Service\S3AuthService;
 use OCA\S3Api\Service\S3RequestBody;
@@ -35,6 +36,7 @@ class S3Controller extends Controller {
 		private BucketMapper $bucketMapper,
 		private S3ResponseBuilder $responseBuilder,
 		private S3RequestBody $requestBody,
+		private MultipartService $multipartService,
 		private IRootFolder $rootFolder,
 	) {
 		parent::__construct($appName, $request);
@@ -66,8 +68,20 @@ class S3Controller extends Controller {
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	public function handlePost(string $path = ''): Response {
+		return $this->handleRequest($path);
+	}
+
+	#[PublicPage]
+	#[NoCSRFRequired]
 	public function handleHead(string $path = ''): Response {
 		return $this->handleRequest($path);
+	}
+
+	#[PublicPage]
+	#[NoCSRFRequired]
+	public function handleHeadRoot(): Response {
+		return $this->handleRequest('');
 	}
 
 	private function handleRequest(string $path = ''): Response {
@@ -141,22 +155,173 @@ class S3Controller extends Controller {
 			return $this->errorResponse('NoSuchBucket', 'Bucket path is not a folder', '/' . $bucketName, Http::STATUS_NOT_FOUND);
 		}
 
+		$query = $this->queryParams();
+
 		if ($objectKey === '') {
-			// Bucket-level operations
-			if ($method === 'GET') {
-				return $this->listObjects($userId, $bucket, $bucketFolder);
-			}
-			return $this->errorResponse('MethodNotAllowed', 'Method not allowed', '/' . $bucketName, Http::STATUS_METHOD_NOT_ALLOWED);
+			return $this->dispatchBucket($method, $query, $userId, $bucket, $bucketFolder, $bucketName, $permission);
 		}
 
-		// Object-level operations
+		return $this->dispatchObject($method, $query, $bucket, $bucketFolder, $bucketName, $objectKey, $permission);
+	}
+
+	/**
+	 * Bucket-level requests.
+	 *
+	 * @param array<string, string> $query
+	 */
+	private function dispatchBucket(
+		string $method,
+		array $query,
+		string $userId,
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $permission,
+	): Response {
+		$resource = '/' . $bucketName;
+
+		// Subresources have to be recognised explicitly. Falling through to the
+		// default handler would answer a request for, say, ?versioning with an
+		// object listing, which clients then misparse.
+		foreach (['uploads', 'delete', 'location', 'versioning'] as $known) {
+			if (!array_key_exists($known, $query)) {
+				continue;
+			}
+
+			return match (true) {
+				$known === 'uploads' && $method === 'GET' => $this->listMultipartUploads($bucket, $bucketName),
+				$known === 'delete' && $method === 'POST' => $this->deleteObjects($bucketFolder, $bucketName, $permission),
+				$known === 'location' && $method === 'GET' => $this->xmlResponse($this->responseBuilder->locationXml()),
+				$known === 'versioning' && $method === 'GET' => $this->xmlResponse($this->responseBuilder->versioningXml()),
+				default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
+			};
+		}
+
+		$unsupported = $this->unsupportedSubresource($query, $resource);
+		if ($unsupported !== null) {
+			return $unsupported;
+		}
+
+		return match ($method) {
+			'GET' => $this->listObjects($userId, $bucket, $bucketFolder),
+			// HeadBucket: existence and access were already established above.
+			'HEAD' => new DataDisplayResponse('', Http::STATUS_OK),
+			default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
+		};
+	}
+
+	/**
+	 * Object-level requests.
+	 *
+	 * @param array<string, string> $query
+	 */
+	private function dispatchObject(
+		string $method,
+		array $query,
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $permission,
+	): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		// Multipart upload subresources. Without this, `PUT ?partNumber=1` fell
+		// through to PutObject and stored a single part as the whole object,
+		// reporting success.
+		if (array_key_exists('uploads', $query) && $method === 'POST') {
+			return $this->createMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $permission);
+		}
+
+		$uploadId = $query['uploadId'] ?? null;
+		if ($uploadId !== null) {
+			$partNumber = $query['partNumber'] ?? null;
+
+			return match ($method) {
+				'PUT' => $partNumber !== null
+					? $this->uploadPart($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $partNumber, $permission)
+					: $this->errorResponse('InvalidRequest', 'partNumber is required', $resource, Http::STATUS_BAD_REQUEST),
+				'POST' => $this->completeMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
+				'DELETE' => $this->abortMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
+				'GET' => $this->listParts($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId),
+				default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
+			};
+		}
+
+		$unsupported = $this->unsupportedSubresource($query, $resource);
+		if ($unsupported !== null) {
+			return $unsupported;
+		}
+
 		return match ($method) {
 			'GET' => $this->getObject($bucketFolder, $objectKey, $bucketName),
 			'HEAD' => $this->headObject($bucketFolder, $objectKey, $bucketName),
 			'PUT' => $this->putObject($bucketFolder, $objectKey, $bucketName, $permission),
 			'DELETE' => $this->deleteObject($bucketFolder, $objectKey, $bucketName, $permission),
-			default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', '/' . $bucketName . '/' . $objectKey, Http::STATUS_METHOD_NOT_ALLOWED),
+			default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
 		};
+	}
+
+	/**
+	 * Reject subresources we do not implement instead of silently treating the
+	 * request as an operation on the object itself.
+	 *
+	 * @param array<string, string> $query
+	 */
+	private function unsupportedSubresource(array $query, string $resource): ?Response {
+		$unsupported = [
+			'acl', 'tagging', 'lifecycle', 'policy', 'cors', 'website',
+			'replication', 'encryption', 'notification', 'logging',
+			'accelerate', 'requestPayment', 'analytics', 'inventory',
+			'metrics', 'object-lock', 'legal-hold', 'retention',
+			'attributes', 'select', 'torrent', 'restore', 'publicAccessBlock',
+			'ownershipControls', 'intelligent-tiering', 'versions',
+		];
+
+		foreach ($unsupported as $name) {
+			if (array_key_exists($name, $query)) {
+				return $this->errorResponse(
+					'NotImplemented',
+					'The requested subresource "' . $name . '" is not implemented',
+					$resource,
+					Http::STATUS_NOT_IMPLEMENTED,
+				);
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Query parameters straight from the raw query string.
+	 *
+	 * parse_str() would rewrite dots in keys and cannot represent a valueless
+	 * parameter such as `?uploads`, which is exactly how subresources are
+	 * expressed.
+	 *
+	 * @return array<string, string>
+	 */
+	private function queryParams(): array {
+		$uri = $this->request->getRequestUri();
+		$pos = strpos($uri, '?');
+		if ($pos === false) {
+			return [];
+		}
+
+		$params = [];
+		foreach (explode('&', substr($uri, $pos + 1)) as $pair) {
+			if ($pair === '') {
+				continue;
+			}
+			$eq = strpos($pair, '=');
+			if ($eq === false) {
+				$params[rawurldecode($pair)] = '';
+			} else {
+				$params[rawurldecode(substr($pair, 0, $eq))] = rawurldecode(substr($pair, $eq + 1));
+			}
+		}
+
+		return $params;
 	}
 
 	private function listBuckets(string $userId): Response {
@@ -166,26 +331,33 @@ class S3Controller extends Controller {
 	}
 
 	private function listObjects(string $userId, $bucket, Folder $bucketFolder): Response {
-		$prefix = $this->request->getParam('prefix', '');
-		$delimiter = $this->request->getParam('delimiter', '');
-		$maxKeys = (int)$this->request->getParam('max-keys', '1000');
-		$listType = $this->request->getParam('list-type', '1');
+		// Read from the raw query string: getParam() would rewrite dots in keys
+		// such as start-after=wal/dead.beef.pack.
+		$query = $this->queryParams();
 
-		$nodes = $bucketFolder->getDirectoryListing();
-		$basePath = $bucketFolder->getPath();
+		$prefix = $query['prefix'] ?? '';
+		$delimiter = $query['delimiter'] ?? '';
+		$maxKeysRaw = $query['max-keys'] ?? '';
+		$maxKeys = ctype_digit($maxKeysRaw) ? (int)$maxKeysRaw : 1000;
 
-		if ($listType === '2') {
-			$startAfter = $this->request->getParam('start-after', '');
-			$continuationToken = $this->request->getParam('continuation-token', '');
+		if (($query['list-type'] ?? '1') === '2') {
 			$xml = $this->responseBuilder->listObjectsV2Xml(
-				$bucket->getBucketName(), $nodes, $prefix, $delimiter,
-				$startAfter, $continuationToken, $maxKeys, $basePath,
+				$bucket->getBucketName(),
+				$bucketFolder,
+				$prefix,
+				$delimiter,
+				$query['start-after'] ?? '',
+				$query['continuation-token'] ?? '',
+				$maxKeys,
 			);
 		} else {
-			$marker = $this->request->getParam('marker', '');
 			$xml = $this->responseBuilder->listObjectsXml(
-				$bucket->getBucketName(), $nodes, $prefix, $delimiter,
-				$marker, $maxKeys, $basePath,
+				$bucket->getBucketName(),
+				$bucketFolder,
+				$prefix,
+				$delimiter,
+				$query['marker'] ?? '',
+				$maxKeys,
 			);
 		}
 
@@ -500,6 +672,317 @@ class S3Controller extends Controller {
 		$response = new DataDisplayResponse('');
 		$response->setStatus(Http::STATUS_NO_CONTENT);
 		return $response;
+	}
+
+	// ---- multipart upload -------------------------------------------------
+
+	private function createMultipartUpload(
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $permission,
+	): Response {
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Write access denied', '/' . $bucketName . '/' . $objectKey, Http::STATUS_FORBIDDEN);
+		}
+
+		$uploadId = $this->multipartService->create(
+			$bucket->getId(),
+			$bucket->getUserId(),
+			$objectKey,
+		);
+
+		return $this->xmlResponse(
+			$this->responseBuilder->initiateMultipartUploadXml($bucketName, $objectKey, $uploadId),
+		);
+	}
+
+	private function uploadPart(
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $uploadId,
+		string $partNumber,
+		string $permission,
+	): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
+		}
+
+		if (!ctype_digit($partNumber)) {
+			return $this->errorResponse('InvalidArgument', 'partNumber must be a number', $resource, Http::STATUS_BAD_REQUEST);
+		}
+
+		try {
+			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
+
+			$sha256 = null;
+			$stream = $this->requestBody->toStream($this->request, $sha256);
+
+			$declared = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
+			if ($declared !== '' && ctype_xdigit($declared) && strlen($declared) === 64
+				&& !hash_equals($declared, (string)$sha256)) {
+				fclose($stream);
+				return $this->errorResponse('XAmzContentSHA256Mismatch', 'The provided x-amz-content-sha256 does not match what was computed', $resource, Http::STATUS_BAD_REQUEST);
+			}
+
+			try {
+				$etag = $this->multipartService->putPart($bucketFolder, $uploadId, (int)$partNumber, $stream);
+			} finally {
+				if (is_resource($stream)) {
+					fclose($stream);
+				}
+			}
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		} catch (LockedException) {
+			return $this->errorResponse('SlowDown', 'The upload is locked by another operation, please retry', $resource, Http::STATUS_SERVICE_UNAVAILABLE);
+		}
+
+		$response = new DataDisplayResponse('');
+		$response->addHeader('ETag', '"' . $etag . '"');
+		return $response;
+	}
+
+	private function completeMultipartUpload(
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $uploadId,
+		string $permission,
+	): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
+		}
+
+		try {
+			$upload = $this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
+
+			$requested = $this->parseCompleteBody(file_get_contents('php://input') ?: '');
+			if ($requested === null) {
+				return $this->errorResponse('MalformedXML', 'The XML you provided was not well-formed', $resource, Http::STATUS_BAD_REQUEST);
+			}
+
+			$result = $this->multipartService->complete(
+				$bucketFolder,
+				$upload,
+				$requested,
+				fn($assembled) => $this->writeAssembledObject($bucketFolder, $objectKey, $assembled),
+			);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		} catch (LockedException) {
+			return $this->errorResponse('SlowDown', 'The object is locked by another operation, please retry', $resource, Http::STATUS_SERVICE_UNAVAILABLE);
+		}
+
+		$location = $this->request->getServerProtocol() . '://' . $this->request->getServerHost()
+			. '/apps/s3_api/s3/' . $bucketName . '/' . $objectKey;
+
+		return $this->xmlResponse(
+			$this->responseBuilder->completeMultipartUploadXml($location, $bucketName, $objectKey, $result['etag']),
+		);
+	}
+
+	private function abortMultipartUpload(
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $uploadId,
+		string $permission,
+	): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
+		}
+
+		try {
+			$upload = $this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
+			$this->multipartService->discard($bucketFolder, $upload);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		}
+
+		return new DataDisplayResponse('', Http::STATUS_NO_CONTENT);
+	}
+
+	private function listParts(
+		$bucket,
+		Folder $bucketFolder,
+		string $bucketName,
+		string $objectKey,
+		string $uploadId,
+	): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		try {
+			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
+			$parts = $this->multipartService->listParts($bucketFolder, $uploadId);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		}
+
+		return $this->xmlResponse(
+			$this->responseBuilder->listPartsXml($bucketName, $objectKey, $uploadId, $parts),
+		);
+	}
+
+	private function listMultipartUploads($bucket, string $bucketName): Response {
+		$uploads = $this->multipartService->listUploads($bucket->getId());
+		return $this->xmlResponse(
+			$this->responseBuilder->listMultipartUploadsXml($bucketName, $uploads),
+		);
+	}
+
+	/**
+	 * Write the assembled multipart object, creating parent folders.
+	 *
+	 * @param resource $assembled
+	 */
+	private function writeAssembledObject(Folder $bucketFolder, string $objectKey, $assembled): File {
+		$targetFolder = $this->ensureParentFolder($bucketFolder, $objectKey);
+		$fileName = basename($objectKey);
+
+		try {
+			$existing = $targetFolder->get($fileName);
+			if (!($existing instanceof File)) {
+				throw new S3AuthException('InvalidArgument', 'Target exists and is not a file', Http::STATUS_CONFLICT);
+			}
+			$existing->putContent($assembled);
+			$file = $existing;
+		} catch (NotFoundException) {
+			$file = $targetFolder->newFile($fileName, $assembled);
+		}
+
+		$reread = $targetFolder->get($fileName);
+		return $reread instanceof File ? $reread : $file;
+	}
+
+	/**
+	 * Parse the part list from a CompleteMultipartUpload body.
+	 *
+	 * @return array<int, array{number: int, etag: string}>|null null when the
+	 *         XML cannot be parsed
+	 */
+	private function parseCompleteBody(string $xml): ?array {
+		if (trim($xml) === '') {
+			return null;
+		}
+
+		$previous = libxml_use_internal_errors(true);
+		try {
+			// LIBXML_NONET plus no entity substitution: the body is untrusted,
+			// and an XXE here would read server-side files.
+			$doc = simplexml_load_string($xml, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOENT);
+		} finally {
+			libxml_clear_errors();
+			libxml_use_internal_errors($previous);
+		}
+
+		if ($doc === false) {
+			return null;
+		}
+
+		$parts = [];
+		foreach ($doc->Part as $part) {
+			$number = (int)$part->PartNumber;
+			if ($number < 1) {
+				return null;
+			}
+			$parts[] = [
+				'number' => $number,
+				'etag' => trim((string)$part->ETag),
+			];
+		}
+
+		return $parts === [] ? null : $parts;
+	}
+
+	// ---- bulk delete ------------------------------------------------------
+
+	private function deleteObjects(Folder $bucketFolder, string $bucketName, string $permission): Response {
+		$resource = '/' . $bucketName;
+
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
+		}
+
+		$body = file_get_contents('php://input') ?: '';
+		$previous = libxml_use_internal_errors(true);
+		try {
+			$doc = simplexml_load_string($body, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOENT);
+		} finally {
+			libxml_clear_errors();
+			libxml_use_internal_errors($previous);
+		}
+
+		if ($doc === false) {
+			return $this->errorResponse('MalformedXML', 'The XML you provided was not well-formed', $resource, Http::STATUS_BAD_REQUEST);
+		}
+
+		$quiet = strtolower(trim((string)$doc->Quiet)) === 'true';
+
+		$deleted = [];
+		$errors = [];
+		foreach ($doc->Object as $object) {
+			$key = (string)$object->Key;
+			if ($key === '') {
+				continue;
+			}
+
+			try {
+				$node = $bucketFolder->get($key);
+				$node->delete();
+				$deleted[] = $key;
+			} catch (NotFoundException) {
+				// Deleting a missing key is a success in S3.
+				$deleted[] = $key;
+			} catch (LockedException) {
+				$errors[] = ['key' => $key, 'code' => 'SlowDown', 'message' => 'The object is locked, please retry'];
+			} catch (\Throwable) {
+				$errors[] = ['key' => $key, 'code' => 'InternalError', 'message' => 'Could not delete the object'];
+			}
+		}
+
+		return $this->xmlResponse(
+			$this->responseBuilder->deleteResultXml($quiet ? [] : $deleted, $errors),
+		);
+	}
+
+	/**
+	 * Create and return the folder holding `$objectKey`.
+	 */
+	private function ensureParentFolder(Folder $bucketFolder, string $objectKey): Folder {
+		$dir = dirname($objectKey);
+		if ($dir === '' || $dir === '.') {
+			return $bucketFolder;
+		}
+
+		$folder = $bucketFolder;
+		foreach (explode('/', $dir) as $part) {
+			if ($part === '' || $part === '.') {
+				continue;
+			}
+			try {
+				$sub = $folder->get($part);
+				if (!($sub instanceof Folder)) {
+					throw new S3AuthException('InvalidArgument', 'Path component is not a directory', Http::STATUS_CONFLICT);
+				}
+				$folder = $sub;
+			} catch (NotFoundException) {
+				$folder = $folder->newFolder($part);
+			}
+		}
+
+		return $folder;
 	}
 
 	private function xmlResponse(string $xml, int $status = Http::STATUS_OK): Response {
