@@ -17,6 +17,9 @@ The API is accessible via path-style S3 requests and supports AWS Signature V4 a
 	<dependencies>
 		<nextcloud min-version="30" max-version="34" />
 	</dependencies>
+	<background-jobs>
+		<job>OCA\S3Api\BackgroundJob\CleanupJob</job>
+	</background-jobs>
 	<settings>
 		<personal>OCA\S3Api\Settings\Personal</personal>
 		<personal-section>OCA\S3Api\Settings\PersonalSection</personal-section>

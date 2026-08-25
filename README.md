@@ -146,6 +146,25 @@ takes leases during maintenance.
   `upload_max_filesize` and the web server's body limit (nginx
   `client_max_body_size`). Multipart uploads sidestep this, which is why the
   threshold above is lowered.
+- **Cron.** Abandoned multipart uploads are only reclaimed if Nextcloud's
+  background jobs run.
+
+### Verifying it yourself
+
+walgit's store contract suite runs against any endpoint:
+
+```bash
+git clone https://github.com/tobi/walgit && cd walgit
+WALGIT_TEST_S3_ENDPOINT=https://<nextcloud-host>/apps/s3_api/s3/ \
+WALGIT_TEST_BUCKET=<bucket> \
+AWS_ACCESS_KEY_ID=<access-key> \
+AWS_SECRET_ACCESS_KEY=<secret-key> \
+  cargo test -p walgit-store --test contract s3_contract
+```
+
+It covers conditional create/update under 32-way concurrency, conditional and
+ranged reads, delimited listings, an 8 MiB streamed round trip verified by
+digest, multipart uploads and server-side compose.
 
 ## Supported S3 operations
 
@@ -187,11 +206,16 @@ otherwise be handled as an operation on the object itself.
   first read.
 - **Conditional writes** return `412 PreconditionFailed`. `If-None-Match: *`
   means create-only; `If-Match: <etag>` means replace exactly that version.
+  Concurrent conditional writes to one key are serialised, so exactly one of a
+  set of racing creates or updates succeeds — which is what makes the store
+  usable as a compare-and-swap primitive.
 - **Streaming.** Bodies are decoded and written as a stream, so uploads are not
   held in memory. `Content-Encoding: aws-chunked` with a trailing checksum (the
   default for current AWS SDKs) is decoded rather than stored verbatim.
 - **Multipart parts** live in a hidden `.s3-uploads/` folder inside the bucket
-  while an upload is in flight and are excluded from listings.
+  while an upload is in flight and are excluded from listings. Uploads that are
+  never completed or aborted are reclaimed after a week by a background job, so
+  Nextcloud's cron has to be running.
 - **Keys map to paths.** A key containing `/` creates folders, so `a/b` and `a`
   cannot both be objects.
 
