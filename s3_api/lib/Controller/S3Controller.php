@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\S3Api\Controller;
 
 use OCA\S3Api\Db\BucketMapper;
+use OCA\S3Api\Http\S3ObjectResponse;
 use OCA\S3Api\Service\BucketService;
 use OCA\S3Api\Service\S3AuthException;
 use OCA\S3Api\Service\S3AuthService;
@@ -22,6 +23,7 @@ use OCP\Files\Folder;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
 use OCP\IRequest;
+use OCP\Lock\LockedException;
 
 class S3Controller extends Controller {
 
@@ -69,6 +71,25 @@ class S3Controller extends Controller {
 	}
 
 	private function handleRequest(string $path = ''): Response {
+		$response = $this->dispatch($path);
+
+		// A response to HEAD must not carry a body. Error paths build XML
+		// bodies, so strip them centrally instead of relying on every caller.
+		if ($this->request->getMethod() === 'HEAD' && $response instanceof DataDisplayResponse) {
+			$stripped = new DataDisplayResponse('', $response->getStatus());
+			foreach ($response->getHeaders() as $name => $value) {
+				if (strtolower($name) === 'content-length') {
+					continue;
+				}
+				$stripped->addHeader($name, $value);
+			}
+			return $stripped;
+		}
+
+		return $response;
+	}
+
+	private function dispatch(string $path = ''): Response {
 		try {
 			$auth = $this->authService->authenticate($this->request);
 		} catch (S3AuthException $e) {
@@ -172,43 +193,132 @@ class S3Controller extends Controller {
 	}
 
 	private function getObject(Folder $bucketFolder, string $objectKey, string $bucketName): Response {
-		try {
-			$node = $bucketFolder->get($objectKey);
-		} catch (NotFoundException) {
-			return $this->errorResponse('NoSuchKey', 'The specified key does not exist', '/' . $bucketName . '/' . $objectKey, Http::STATUS_NOT_FOUND);
-		}
-
-		if (!($node instanceof File)) {
-			return $this->errorResponse('NoSuchKey', 'The specified key is not a file', '/' . $bucketName . '/' . $objectKey, Http::STATUS_NOT_FOUND);
-		}
-
-		$response = new DataDisplayResponse($node->getContent());
-		$response->addHeader('Content-Type', $node->getMimeType());
-		$response->addHeader('Content-Length', (string)$node->getSize());
-		$response->addHeader('ETag', '"' . $node->getEtag() . '"');
-		$response->addHeader('Last-Modified', gmdate('D, d M Y H:i:s \G\M\T', $node->getMTime()));
-		$response->addHeader('Accept-Ranges', 'bytes');
-		return $response;
+		return $this->serveObject($bucketFolder, $objectKey, $bucketName, true);
 	}
 
 	private function headObject(Folder $bucketFolder, string $objectKey, string $bucketName): Response {
+		return $this->serveObject($bucketFolder, $objectKey, $bucketName, false);
+	}
+
+	/**
+	 * Serve an object for GET or HEAD, honouring conditional and range headers.
+	 */
+	private function serveObject(Folder $bucketFolder, string $objectKey, string $bucketName, bool $includeBody): Response {
+		$resource = '/' . $bucketName . '/' . $objectKey;
+
 		try {
 			$node = $bucketFolder->get($objectKey);
 		} catch (NotFoundException) {
-			return $this->errorResponse('NoSuchKey', 'The specified key does not exist', '/' . $bucketName . '/' . $objectKey, Http::STATUS_NOT_FOUND);
+			return $this->errorResponse('NoSuchKey', 'The specified key does not exist', $resource, Http::STATUS_NOT_FOUND, $includeBody);
 		}
 
 		if (!($node instanceof File)) {
-			return $this->errorResponse('NoSuchKey', 'The specified key is not a file', '/' . $bucketName . '/' . $objectKey, Http::STATUS_NOT_FOUND);
+			return $this->errorResponse('NoSuchKey', 'The specified key is not a file', $resource, Http::STATUS_NOT_FOUND, $includeBody);
 		}
 
-		$response = new DataDisplayResponse('');
-		$response->addHeader('Content-Type', $node->getMimeType());
-		$response->addHeader('Content-Length', (string)$node->getSize());
-		$response->addHeader('ETag', '"' . $node->getEtag() . '"');
-		$response->addHeader('Last-Modified', gmdate('D, d M Y H:i:s \G\M\T', $node->getMTime()));
-		$response->addHeader('Accept-Ranges', 'bytes');
-		return $response;
+		$etag = $node->getEtag();
+
+		// RFC 9110: If-Match is evaluated before If-None-Match.
+		$ifMatch = trim((string)$this->request->getHeader('If-Match'));
+		if ($ifMatch !== '' && !$this->etagMatches($ifMatch, $etag)) {
+			return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED, $includeBody);
+		}
+
+		// A matching If-None-Match means the caller's copy is current. This is
+		// the cheap freshness check clients poll with, so it must not send a
+		// body.
+		$ifNoneMatch = trim((string)$this->request->getHeader('If-None-Match'));
+		if ($ifNoneMatch !== '' && $this->etagMatches($ifNoneMatch, $etag)) {
+			$response = new DataDisplayResponse('', Http::STATUS_NOT_MODIFIED);
+			$response->addHeader('ETag', '"' . $etag . '"');
+			return $response;
+		}
+
+		$size = $node->getSize();
+		$range = $this->parseRange((string)$this->request->getHeader('Range'), $size);
+
+		if ($range === false) {
+			$response = $this->errorResponse('InvalidRange', 'The requested range is not satisfiable', $resource, Http::STATUS_REQUESTED_RANGE_NOT_SATISFIABLE, $includeBody);
+			$response->addHeader('Content-Range', 'bytes */' . $size);
+			return $response;
+		}
+
+		if ($range === null) {
+			return new S3ObjectResponse($node, $includeBody);
+		}
+
+		return new S3ObjectResponse($node, $includeBody, $range[0], $range[1]);
+	}
+
+	/**
+	 * Parse a `Range` header.
+	 *
+	 * Only a single range is honoured; multipart/byteranges responses are not
+	 * worth the complexity for an S3 endpoint, and clients that ask for several
+	 * ranges accept the whole object instead.
+	 *
+	 * @return array{0: int, 1: int}|null|false offsets (inclusive), null for no
+	 *         range, false when the range cannot be satisfied
+	 */
+	private function parseRange(string $header, int $size): array|null|false {
+		$header = trim($header);
+		if ($header === '' || !str_starts_with($header, 'bytes=')) {
+			return null;
+		}
+
+		$spec = substr($header, 6);
+		if (str_contains($spec, ',')) {
+			// Multiple ranges: serve the entire object, which is always legal.
+			return null;
+		}
+
+		$dash = strpos($spec, '-');
+		if ($dash === false) {
+			return null;
+		}
+
+		$fromRaw = trim(substr($spec, 0, $dash));
+		$toRaw = trim(substr($spec, $dash + 1));
+
+		if ($fromRaw === '') {
+			// Suffix range: the last N bytes.
+			if ($toRaw === '' || !ctype_digit($toRaw)) {
+				return null;
+			}
+			$suffix = (int)$toRaw;
+			if ($suffix === 0) {
+				return false;
+			}
+			if ($size === 0) {
+				return false;
+			}
+			$start = $suffix >= $size ? 0 : $size - $suffix;
+			return [$start, $size - 1];
+		}
+
+		if (!ctype_digit($fromRaw)) {
+			return null;
+		}
+
+		$start = (int)$fromRaw;
+		if ($start >= $size) {
+			return false;
+		}
+
+		if ($toRaw === '') {
+			return [$start, $size - 1];
+		}
+
+		if (!ctype_digit($toRaw)) {
+			return null;
+		}
+
+		$end = min((int)$toRaw, $size - 1);
+		if ($end < $start) {
+			return false;
+		}
+
+		return [$start, $end];
 	}
 
 	private function putObject(Folder $bucketFolder, string $objectKey, string $bucketName, string $permission): Response {
@@ -280,30 +390,32 @@ class S3Controller extends Controller {
 			);
 		}
 
+		// Hand the stream to Nextcloud rather than writing through fopen():
+		// putContent() copies it under an exclusive lock and updates the file
+		// cache, so size and ETag reflect the new content. Writing to the raw
+		// handle leaves stale metadata behind, which breaks ETag-based
+		// conditional requests.
 		try {
 			if ($existing instanceof File) {
-				$file = $existing;
-				$target = $file->fopen('wb');
-				if ($target === false) {
-					return $this->errorResponse('InternalError', 'Cannot open object for writing', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
-				}
-				stream_copy_to_stream($stream, $target);
-				fclose($target);
+				$existing->putContent($stream);
 			} else {
-				$file = $targetFolder->newFile($fileName);
-				$target = $file->fopen('wb');
-				if ($target === false) {
-					return $this->errorResponse('InternalError', 'Cannot open object for writing', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
-				}
-				stream_copy_to_stream($stream, $target);
-				fclose($target);
+				$targetFolder->newFile($fileName, $stream);
 			}
+		} catch (LockedException) {
+			return $this->errorResponse('SlowDown', 'The object is locked by another operation, please retry', $resource, Http::STATUS_SERVICE_UNAVAILABLE);
 		} finally {
-			fclose($stream);
+			// putContent()/newFile() close the stream themselves; guard against
+			// the paths that do not.
+			if (is_resource($stream)) {
+				fclose($stream);
+			}
 		}
 
-		// Re-read metadata so the ETag reflects what we just stored.
+		// Re-read the node so the ETag is the one now stored.
 		$file = $targetFolder->get($fileName);
+		if (!($file instanceof File)) {
+			return $this->errorResponse('InternalError', 'Object vanished after write', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
 
 		$response = new DataDisplayResponse('');
 		$response->setStatus(Http::STATUS_OK);
@@ -396,7 +508,17 @@ class S3Controller extends Controller {
 		return $response;
 	}
 
-	private function errorResponse(string $code, string $message, string $resource, int $httpStatus): Response {
+	/**
+	 * @param bool $withBody false to omit the XML body, which a response to
+	 *        HEAD must do
+	 */
+	private function errorResponse(string $code, string $message, string $resource, int $httpStatus, bool $withBody = true): Response {
+		if (!$withBody) {
+			$response = new DataDisplayResponse('', $httpStatus);
+			$response->addHeader('Content-Type', 'application/xml');
+			return $response;
+		}
+
 		$xml = $this->responseBuilder->errorXml($code, $message, $resource);
 		return $this->xmlResponse($xml, $httpStatus);
 	}
