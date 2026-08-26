@@ -141,7 +141,7 @@ class S3Controller extends Controller {
 		if ($path === '') {
 			// ListBuckets
 			if ($method === 'GET') {
-				return $this->listBuckets($userId);
+				return $this->listBuckets($userId, $auth['bucketId']);
 			}
 			return $this->errorResponse('MethodNotAllowed', 'Method not allowed', '/', Http::STATUS_METHOD_NOT_ALLOWED);
 		}
@@ -396,8 +396,19 @@ class S3Controller extends Controller {
 		return $params;
 	}
 
-	private function listBuckets(string $userId): Response {
-		$buckets = $this->bucketService->listBuckets($userId);
+	/**
+	 * ListBuckets, restricted to the bucket the credential is scoped to.
+	 *
+	 * Credentials are issued per bucket, so listing every bucket the owning
+	 * account happens to have would tell the holder of one key about buckets it
+	 * cannot address.
+	 */
+	private function listBuckets(string $userId, int $bucketId): Response {
+		$buckets = array_values(array_filter(
+			$this->bucketService->listBuckets($userId),
+			static fn($bucket): bool => $bucket->getId() === $bucketId,
+		));
+
 		$xml = $this->responseBuilder->listBucketsXml($userId, $buckets);
 		return $this->xmlResponse($xml);
 	}

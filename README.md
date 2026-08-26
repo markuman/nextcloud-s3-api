@@ -239,7 +239,8 @@ string). Requests older than 15 minutes are rejected, as are presigned URLs past
 their expiry.
 
 Each API key is bound to exactly one bucket and is either `readonly` or
-`readwrite`.
+`readwrite`. `ListBuckets` reports only the bucket the presented key is scoped
+to, not every bucket the owning account happens to have.
 
 ## License
 

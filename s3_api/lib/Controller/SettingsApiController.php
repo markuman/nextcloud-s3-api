@@ -63,10 +63,12 @@ class SettingsApiController extends Controller {
 	#[NoAdminRequired]
 	public function listKeys(int $bucketId): JSONResponse {
 		try {
-			$keys = $this->apiKeyService->listKeys($bucketId);
+			$keys = $this->apiKeyService->listKeys($bucketId, $this->userId);
 			return new JSONResponse(array_map(fn($k) => $k->jsonSerialize(), $keys));
-		} catch (\Exception $e) {
-			return new JSONResponse(['error' => $e->getMessage()], Http::STATUS_INTERNAL_SERVER_ERROR);
+		} catch (DoesNotExistException) {
+			// Same answer whether the bucket belongs to someone else or does not
+			// exist, so the response cannot be used to probe for bucket ids.
+			return new JSONResponse(['error' => 'Bucket not found'], Http::STATUS_NOT_FOUND);
 		}
 	}
 
@@ -97,7 +99,7 @@ class SettingsApiController extends Controller {
 	#[NoAdminRequired]
 	public function deleteKey(int $bucketId, int $keyId): JSONResponse {
 		try {
-			$this->apiKeyService->deleteKey($keyId, $this->userId);
+			$this->apiKeyService->deleteKey($keyId, $bucketId, $this->userId);
 			return new JSONResponse(['status' => 'ok']);
 		} catch (DoesNotExistException) {
 			return new JSONResponse(['error' => 'Key not found'], Http::STATUS_NOT_FOUND);
