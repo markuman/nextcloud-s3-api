@@ -155,6 +155,10 @@ class S3Controller extends Controller {
 			$objectKey = substr($path, $slashPos + 1);
 		}
 
+		if ($objectKey !== '' && !$this->isUsableKey($objectKey)) {
+			return $this->errorResponse('InvalidArgument', 'The specified key is not valid', '/' . $bucketName . '/' . $objectKey, Http::STATUS_BAD_REQUEST);
+		}
+
 		// Verify bucket access
 		$bucket = $this->bucketService->getBucketByName($userId, $bucketName);
 		if ($bucket === null) {
@@ -325,6 +329,42 @@ class S3Controller extends Controller {
 	}
 
 	/**
+	 * Whether a key can be stored as a path under the bucket folder.
+	 *
+	 * S3 keys are opaque byte strings, but here they become file paths, so the
+	 * ones that cannot be are rejected up front. Nextcloud refuses these anyway
+	 * -- nothing escapes the bucket -- but it does so by raising, which would
+	 * surface as an unhelpful 500 instead of a client error naming the problem.
+	 */
+	private function isUsableKey(string $objectKey): bool {
+		if (str_contains($objectKey, "\0")) {
+			return false;
+		}
+
+		// A trailing slash denotes a "directory marker", which has no file to
+		// store it in.
+		if (str_ends_with($objectKey, '/')) {
+			return false;
+		}
+
+		foreach (explode('/', $objectKey) as $segment) {
+			// Empty segments come from "a//b"; "." and ".." would resolve
+			// outside the intended path.
+			if ($segment === '' || $segment === '.' || $segment === '..') {
+				return false;
+			}
+		}
+
+		// The multipart scratch area is internal.
+		if (str_starts_with($objectKey, MultipartService::SCRATCH_DIR . '/')
+			|| $objectKey === MultipartService::SCRATCH_DIR) {
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
 	 * Query parameters straight from the raw query string.
 	 *
 	 * parse_str() would rewrite dots in keys and cannot represent a valueless
@@ -442,7 +482,7 @@ class S3Controller extends Controller {
 		$range = $this->parseRange((string)$this->request->getHeader('Range'), $size);
 
 		if ($range === false) {
-			$response = $this->errorResponse('InvalidRange', 'The requested range is not satisfiable', $resource, Http::STATUS_REQUESTED_RANGE_NOT_SATISFIABLE, $includeBody);
+			$response = $this->errorResponse('InvalidRange', 'The requested range is not satisfiable', $resource, Http::STATUS_REQUEST_RANGE_NOT_SATISFIABLE, $includeBody);
 			$response->addHeader('Content-Range', 'bytes */' . $size);
 			return $response;
 		}
