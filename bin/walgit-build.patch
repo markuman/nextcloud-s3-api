@@ -1,0 +1,64 @@
+diff --git a/crates/walgit-server/Cargo.toml b/crates/walgit-server/Cargo.toml
+index 75a0bb8..bb6ebe0 100644
+--- a/crates/walgit-server/Cargo.toml
++++ b/crates/walgit-server/Cargo.toml
+@@ -64,6 +64,8 @@ rustls.workspace = true
+ rustls-pemfile.workspace = true
+ rcgen.workspace = true
+ tokio-rustls.workspace = true
++tempfile.workspace = true
++
+ [dev-dependencies]
+ tempfile.workspace = true
+ reqwest.workspace = true
+diff --git a/crates/walgit-server/src/lib.rs b/crates/walgit-server/src/lib.rs
+index a56149d..df5b171 100644
+--- a/crates/walgit-server/src/lib.rs
++++ b/crates/walgit-server/src/lib.rs
+@@ -317,9 +317,12 @@ async fn dispatch(
+ }
+ 
+ pub(crate) fn request_peer(req: &Request<Body>) -> Option<SocketAddr> {
++    // The plain-TCP path carries `PeerAddr`; the TLS path serves the router
++    // directly and has no connect-info at all.
+     req.extensions()
+-        .get::<ConnectInfo<SocketAddr>>()
+-        .map(|c| c.0)
++        .get::<ConnectInfo<PeerAddr>>()
++        .map(|c| c.0.0)
++        .or_else(|| req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0))
+ }
+ 
+ /// Route a parsed repo request (`/{owner}/{repo}[.git]/<sub>` or the same sub
+@@ -513,6 +516,22 @@ impl axum::serve::Listener for NodelayListener {
+     }
+ }
+ 
++/// Peer address for connections accepted by [`NodelayListener`].
++///
++/// axum implements `Connected` for `SocketAddr` only for its own `TcpListener`,
++/// and the orphan rule bars implementing a foreign trait on a foreign type, so
++/// a custom listener needs its own connect-info type.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct PeerAddr(pub SocketAddr);
++
++impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NodelayListener>>
++    for PeerAddr
++{
++    fn connect_info(stream: axum::serve::IncomingStream<'_, NodelayListener>) -> Self {
++        PeerAddr(*stream.remote_addr())
++    }
++}
++
+ /// Bind, serve (HTTP/1.1 + h2c, or TLS with ALPN h2/http1.1 when
+ /// `server.tls` is on), graceful shutdown on `shutdown`.
+ pub async fn serve(
+@@ -582,7 +601,7 @@ pub async fn serve(
+             None => {
+                 axum::serve(
+                     NodelayListener(listener),
+-                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
++                    app.into_make_service_with_connect_info::<PeerAddr>(),
+                 )
+                 .with_graceful_shutdown(graceful)
+                 .await

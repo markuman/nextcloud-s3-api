@@ -1,0 +1,7 @@
+# The walgit binary is ~54 MB; bin/README.md and bin/walgit-build.patch carry
+# everything needed to rebuild it.
+/bin/walgit
+
+# Scratch files from manual testing
+/test.txt
+/settings.png
