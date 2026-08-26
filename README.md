@@ -166,11 +166,10 @@ It covers conditional create/update under 32-way concurrency, conditional and
 ranged reads, delimited listings, an 8 MiB streamed round trip verified by
 digest, multipart uploads and server-side compose.
 
-For an end-to-end check with real git, `bin/` has a prebuilt `walgit` and the
-patch it needs (upstream does not currently compile); `bin/README.md` explains
-both. Pointing it at a bucket and pushing a 2000-commit repository, cloning it
-back into an empty cache and running `git fsck --strict` exercises the whole
-path — that is what the object layout below comes from:
+For an end-to-end check with real git, `bin/README.md` has build instructions
+for a `walgit` binary. Pointing it at a bucket and pushing a 2000-commit
+repository, cloning it back into an empty cache and running `git fsck --strict`
+exercises the whole path — that is what the object layout below comes from:
 
 ```
 repos/<owner>/<repo>/manifest.pb      # the CAS commit point
