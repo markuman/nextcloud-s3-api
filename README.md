@@ -223,7 +223,10 @@ otherwise be handled as an operation on the object itself.
   usable as a compare-and-swap primitive.
 - **Streaming.** Bodies are decoded and written as a stream, so uploads are not
   held in memory. `Content-Encoding: aws-chunked` with a trailing checksum (the
-  default for current AWS SDKs) is decoded rather than stored verbatim.
+  default for current AWS SDKs) is decoded rather than stored verbatim. Where
+  the client signs each chunk (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) the
+  signature chain is verified, which is what ties the uploaded bytes to the
+  credential — with that payload type SigV4 covers only the headers.
 - **Multipart parts** live in a hidden `.s3-uploads/` folder inside the bucket
   while an upload is in flight and are excluded from listings. Uploads that are
   never completed or aborted are reclaimed after a week by a background job, so
@@ -236,7 +239,7 @@ otherwise be handled as an operation on the object itself.
 Requests are authenticated with **AWS Signature V4**, either through the
 `Authorization` header or as a presigned URL (`X-Amz-Signature` in the query
 string). Requests older than 15 minutes are rejected, as are presigned URLs past
-their expiry.
+their expiry; `X-Amz-Expires` is capped at seven days, as on AWS.
 
 Each API key is bound to exactly one bucket and is either `readonly` or
 `readwrite`. `ListBuckets` reports only the bucket the presented key is scoped

@@ -27,11 +27,12 @@ use OCP\IRequest;
  * here, distinguished by the `x-amz-content-sha256` header:
  *
  * - `STREAMING-UNSIGNED-PAYLOAD-TRAILER`: chunk sizes only, checksum in a
- *   trailer.
+ *   trailer. The signature covers the headers, not the bytes.
  * - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`: each chunk additionally
- *   carries a `chunk-signature`. The signatures are parsed and skipped but
- *   not verified; the request as a whole is still authenticated via SigV4 and
- *   the seed signature.
+ *   carries a `chunk-signature` chained from the request's seed signature.
+ *   Given a {@see ChunkSignatureVerifier} the chain is checked, which is what
+ *   binds the body to the credential: the payload hash in the canonical request
+ *   is a sentinel here, so without that check the bytes are unauthenticated.
  *
  * Everything is streamed, so a multi-gigabyte upload never has to fit in
  * memory.
@@ -103,10 +104,13 @@ class S3RequestBody {
 	 * caller can verify `x-amz-content-sha256` when it is a literal hash.
 	 *
 	 * @param resource|null $input Body handle; defaults to `php://input`.
+	 * @param ChunkSignatureVerifier|null $verifier checks the chunk signature
+	 *        chain, binding the bytes to the credential; null when the request
+	 *        carries no chunk signatures
 	 * @return resource
-	 * @throws S3AuthException on a malformed chunked body
+	 * @throws S3AuthException on a malformed chunked body or a bad signature
 	 */
-	public function toStream(IRequest $request, &$sha256 = null, $input = null) {
+	public function toStream(IRequest $request, &$sha256 = null, $input = null, ?ChunkSignatureVerifier $verifier = null) {
 		$ownsInput = false;
 		if ($input === null) {
 			$input = fopen('php://input', 'rb');
@@ -128,7 +132,7 @@ class S3RequestBody {
 
 		try {
 			if ($this->isChunked($request)) {
-				$this->copyChunked($input, $out, $hashCtx);
+				$this->copyChunked($input, $out, $hashCtx, $verifier);
 			} else {
 				$this->copyRaw($input, $out, $hashCtx);
 			}
@@ -177,13 +181,24 @@ class S3RequestBody {
 	 * @param resource $out
 	 * @param \HashContext $hashCtx
 	 */
-	private function copyChunked($in, $out, \HashContext $hashCtx): void {
+	private function copyChunked($in, $out, \HashContext $hashCtx, ?ChunkSignatureVerifier $verifier = null): void {
 		while (true) {
 			$line = $this->readLine($in);
 			if ($line === null) {
-				// Body ended without a terminating zero-length chunk. Accept it:
-				// the payload we decoded so far is complete for every SDK we
-				// have seen, and rejecting would turn a working upload into a
+				// Body ended without a terminating zero-length chunk.
+				if ($verifier !== null) {
+					// With signed chunks the terminator is what proves the body
+					// ended where the signer said it did, so a truncated body
+					// must not pass.
+					throw new S3AuthException(
+						'IncompleteBody',
+						'aws-chunked body ended without its final chunk',
+						Http::STATUS_BAD_REQUEST,
+					);
+				}
+
+				// Unsigned: the payload decoded so far is complete for every SDK
+				// we have seen, and rejecting would turn a working upload into a
 				// failure.
 				return;
 			}
@@ -199,6 +214,7 @@ class S3RequestBody {
 			$semicolon = strpos($line, ';');
 			$sizeHex = $semicolon === false ? $line : substr($line, 0, $semicolon);
 			$sizeHex = trim($sizeHex);
+			$extensions = $semicolon === false ? '' : substr($line, $semicolon + 1);
 
 			if ($sizeHex === '' || !ctype_xdigit($sizeHex)) {
 				throw new S3AuthException(
@@ -218,16 +234,53 @@ class S3RequestBody {
 			}
 
 			if ($size === 0) {
-				// Final chunk: trailers (if any) follow, none of which belong
-				// to the object content.
+				// Final chunk: signed over the empty string. Trailers may follow
+				// and belong to none of the object's content.
+				if ($verifier !== null) {
+					$verifier->verifyChunk(
+						$this->chunkSignature($extensions),
+						hash('sha256', ''),
+					);
+				}
 				return;
 			}
 
-			$this->copyExactly($in, $out, $hashCtx, $size);
+			// A signed chunk has to be hashed as a whole to check it, so keep it
+			// aside; chunk sizes are bounded by MAX_CHUNK_SIZE.
+			$chunkHash = $verifier === null ? null : hash_init('sha256');
+			$this->copyExactly($in, $out, $hashCtx, $size, $chunkHash);
+
+			if ($verifier !== null) {
+				$verifier->verifyChunk(
+					$this->chunkSignature($extensions),
+					hash_final($chunkHash),
+				);
+			}
 
 			// Each chunk's payload is followed by CRLF.
 			$this->consumeCrlf($in);
 		}
+	}
+
+	/**
+	 * Pull `chunk-signature=` out of a chunk header's extensions.
+	 *
+	 * @throws S3AuthException when it is absent, since the caller only asks
+	 *         while verifying a signed body
+	 */
+	private function chunkSignature(string $extensions): string {
+		foreach (explode(';', $extensions) as $extension) {
+			$extension = trim($extension);
+			if (str_starts_with($extension, 'chunk-signature=')) {
+				return substr($extension, strlen('chunk-signature='));
+			}
+		}
+
+		throw new S3AuthException(
+			'IncompleteBody',
+			'A chunk is missing its signature',
+			Http::STATUS_BAD_REQUEST,
+		);
 	}
 
 	/**
@@ -237,7 +290,7 @@ class S3RequestBody {
 	 * @param resource $out
 	 * @param \HashContext $hashCtx
 	 */
-	private function copyExactly($in, $out, \HashContext $hashCtx, int $size): void {
+	private function copyExactly($in, $out, \HashContext $hashCtx, int $size, ?\HashContext $chunkHash = null): void {
 		$remaining = $size;
 		while ($remaining > 0) {
 			$buf = fread($in, (int)min($remaining, self::CHUNK));
@@ -252,6 +305,9 @@ class S3RequestBody {
 				continue;
 			}
 			hash_update($hashCtx, $buf);
+			if ($chunkHash !== null) {
+				hash_update($chunkHash, $buf);
+			}
 			if (fwrite($out, $buf) === false) {
 				throw new S3AuthException('InternalError', 'Failed writing request body', Http::STATUS_INTERNAL_SERVER_ERROR);
 			}

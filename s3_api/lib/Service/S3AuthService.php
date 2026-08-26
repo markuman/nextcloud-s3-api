@@ -25,6 +25,9 @@ class S3AuthService {
 	/** Accepted clock skew, matching AWS. */
 	private const MAX_SKEW_SECONDS = 900;
 
+	/** Longest lifetime a presigned URL may ask for, as on AWS: seven days. */
+	private const MAX_PRESIGNED_EXPIRY_SECONDS = 7 * 24 * 3600;
+
 	public function __construct(
 		private ApiKeyService $apiKeyService,
 		private BucketMapper $bucketMapper,
@@ -32,7 +35,7 @@ class S3AuthService {
 	}
 
 	/**
-	 * @return array{userId: string, bucketId: int, permission: string, accessKey: string}
+	 * @return array{userId: string, bucketId: int, permission: string, accessKey: string, chunkVerifier: ?ChunkSignatureVerifier}
 	 * @throws S3AuthException
 	 */
 	public function authenticate(IRequest $request): array {
@@ -57,7 +60,34 @@ class S3AuthService {
 			'bucketId' => $apiKey->getBucketId(),
 			'permission' => $apiKey->getPermission(),
 			'accessKey' => $apiKey->getAccessKey(),
+			'chunkVerifier' => $this->chunkVerifierFor($request, $parsed, $secretKey),
 		];
+	}
+
+	/**
+	 * A verifier for the chunk signature chain, when the request carries one.
+	 *
+	 * With `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` the payload hash the signature
+	 * covers is a sentinel, so the body is only bound to the credential through
+	 * the per-chunk signatures. Requests without them (`UNSIGNED-PAYLOAD`
+	 * variants, or a literal hash) get no verifier.
+	 */
+	private function chunkVerifierFor(IRequest $request, array $parsed, string $secretKey): ?ChunkSignatureVerifier {
+		$payloadHash = strtoupper(trim((string)$request->getHeader('x-amz-content-sha256')));
+		if (!str_starts_with($payloadHash, 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) {
+			return null;
+		}
+
+		$amzDate = $parsed['presigned']
+			? $parsed['amzDate']
+			: (string)$request->getHeader('x-amz-date');
+
+		return new ChunkSignatureVerifier(
+			$parsed['signature'],
+			$this->deriveSigningKey($secretKey, $parsed['date'], $parsed['region']),
+			$amzDate,
+			$parsed['date'] . '/' . $parsed['region'] . '/s3/aws4_request',
+		);
 	}
 
 	/**
@@ -214,14 +244,19 @@ class S3AuthService {
 			? $parsed['amzDate']
 			: (string)$request->getHeader('x-amz-date');
 
-		if ($amzDate === '') {
-			// Signed with a plain `Date` header; nothing precise to compare.
-			return;
-		}
+		$timestamp = $amzDate === ''
+			// Signed with a plain `Date` header instead. Skipping the check here
+			// would leave a captured signature valid forever, so fall back to
+			// parsing that; every current SDK sends x-amz-date, so this is the
+			// unusual path.
+			? $this->parseDateHeader((string)$request->getHeader('Date'))
+			: \DateTimeImmutable::createFromFormat('Ymd\THis\Z', $amzDate, new \DateTimeZone('UTC'));
 
-		$timestamp = \DateTimeImmutable::createFromFormat('Ymd\THis\Z', $amzDate, new \DateTimeZone('UTC'));
-		if ($timestamp === false) {
-			throw new S3AuthException('AccessDenied', 'Malformed x-amz-date');
+		if ($timestamp === false || $timestamp === null) {
+			throw new S3AuthException(
+				'AccessDenied',
+				$amzDate === '' ? 'Missing or malformed request date' : 'Malformed x-amz-date',
+			);
 		}
 
 		// The date in the credential scope must agree with the timestamp,
@@ -234,6 +269,15 @@ class S3AuthService {
 		$signedAt = $timestamp->getTimestamp();
 
 		if ($parsed['presigned'] && $parsed['expires'] !== null) {
+			// Without an upper bound a signer could mint a URL that never
+			// expires, which outlives any sensible key rotation.
+			if ($parsed['expires'] < 1 || $parsed['expires'] > self::MAX_PRESIGNED_EXPIRY_SECONDS) {
+				throw new S3AuthException(
+					'AuthorizationQueryParametersError',
+					'X-Amz-Expires must be between 1 and ' . self::MAX_PRESIGNED_EXPIRY_SECONDS . ' seconds',
+				);
+			}
+
 			if ($now > $signedAt + $parsed['expires']) {
 				throw new S3AuthException('AccessDenied', 'Request has expired');
 			}
@@ -250,6 +294,27 @@ class S3AuthService {
 				'The difference between the request time and the current time is too large',
 			);
 		}
+	}
+
+	/**
+	 * Parse an HTTP-date `Date` header.
+	 *
+	 * Only reached when a client signs with `Date` rather than `x-amz-date`.
+	 */
+	private function parseDateHeader(string $value): ?\DateTimeImmutable {
+		$value = trim($value);
+		if ($value === '') {
+			return null;
+		}
+
+		foreach ([\DateTimeInterface::RFC7231, 'D, d M Y H:i:s O', 'Ymd\THis\Z'] as $format) {
+			$parsed = \DateTimeImmutable::createFromFormat($format, $value, new \DateTimeZone('UTC'));
+			if ($parsed !== false) {
+				return $parsed;
+			}
+		}
+
+		return null;
 	}
 
 	/**

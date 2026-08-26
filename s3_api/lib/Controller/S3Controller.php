@@ -7,6 +7,7 @@ namespace OCA\S3Api\Controller;
 use OCA\S3Api\Db\BucketMapper;
 use OCA\S3Api\Http\S3ObjectResponse;
 use OCA\S3Api\Service\BucketService;
+use OCA\S3Api\Service\ChunkSignatureVerifier;
 use OCA\S3Api\Service\EtagService;
 use OCA\S3Api\Service\MultipartService;
 use OCA\S3Api\Service\ObjectLockService;
@@ -30,6 +31,14 @@ use OCP\Lock\LockedException;
 use Psr\Log\LoggerInterface;
 
 class S3Controller extends Controller {
+
+	/**
+	 * Chunk signature chain for this request, when it carries signed chunks.
+	 *
+	 * Set once the request is authenticated, read by the handlers that consume a
+	 * body. Safe as state because a controller instance serves one request.
+	 */
+	private ?ChunkSignatureVerifier $chunkVerifier = null;
 
 	public function __construct(
 		string $appName,
@@ -132,6 +141,9 @@ class S3Controller extends Controller {
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
 		}
+
+		// Set for this request only; the controller is instantiated per request.
+		$this->chunkVerifier = $auth['chunkVerifier'];
 
 		$userId = $auth['userId'];
 		$permission = $auth['permission'];
@@ -591,7 +603,7 @@ class S3Controller extends Controller {
 		// nothing about it depends on the object's current state.
 		$sha256 = null;
 		try {
-			$stream = $this->requestBody->toStream($this->request, $sha256);
+			$stream = $this->requestBody->toStream($this->request, $sha256, null, $this->chunkVerifier);
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		}
@@ -824,7 +836,7 @@ class S3Controller extends Controller {
 			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
 
 			$sha256 = null;
-			$stream = $this->requestBody->toStream($this->request, $sha256);
+			$stream = $this->requestBody->toStream($this->request, $sha256, null, $this->chunkVerifier);
 
 			$declared = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
 			if ($declared !== '' && ctype_xdigit($declared) && strlen($declared) === 64
@@ -1287,6 +1299,15 @@ class S3Controller extends Controller {
 		foreach ($doc->Object as $object) {
 			$key = (string)$object->Key;
 			if ($key === '') {
+				continue;
+			}
+
+			// Keys arriving in the request body get the same validation as keys
+			// in the request line. Nextcloud's file API is what actually stops a
+			// traversal, but a rejected key belongs in the per-key error list
+			// rather than as a caught exception.
+			if (!$this->isUsableKey($key)) {
+				$errors[] = ['key' => $key, 'code' => 'InvalidArgument', 'message' => 'The specified key is not valid'];
 				continue;
 			}
 
