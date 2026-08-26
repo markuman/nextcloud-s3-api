@@ -434,7 +434,11 @@ class S3AuthService {
 			: (string)$request->getHeader('x-amz-date');
 
 		if ($amzDate === '') {
-			$amzDate = (string)$request->getHeader('Date');
+			// The string to sign always carries an ISO8601 basic timestamp, even
+			// when the client dated the request with an HTTP-date `Date` header,
+			// so convert rather than passing that header through verbatim.
+			$parsedDate = $this->parseDateHeader((string)$request->getHeader('Date'));
+			$amzDate = $parsedDate?->format('Ymd\THis\Z') ?? '';
 		}
 
 		return implode("\n", [
