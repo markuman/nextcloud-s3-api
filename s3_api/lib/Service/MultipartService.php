@@ -186,18 +186,24 @@ class MultipartService {
 
 		$available = $this->listParts($bucketFolder, $upload->getUploadId());
 
+		// Check the ordering over the whole list before looking at any single
+		// part: a misordered list would otherwise be reported as whatever
+		// happens to be wrong with the part that comes first, e.g. [2, 1] as
+		// "part 2 is too small" because part 2 is no longer last.
 		$lastNumber = 0;
-		foreach ($requested as $index => $part) {
-			$number = $part['number'];
-
-			if ($number <= $lastNumber) {
+		foreach ($requested as $part) {
+			if ($part['number'] <= $lastNumber) {
 				throw new S3AuthException(
 					'InvalidPartOrder',
 					'The list of parts was not in ascending order',
 					Http::STATUS_BAD_REQUEST,
 				);
 			}
-			$lastNumber = $number;
+			$lastNumber = $part['number'];
+		}
+
+		foreach ($requested as $index => $part) {
+			$number = $part['number'];
 
 			if (!isset($available[$number])) {
 				throw new S3AuthException(
