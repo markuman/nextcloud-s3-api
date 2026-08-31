@@ -1,0 +1,34 @@
+[store]
+backend = "s3"
+bucket = "git"              # the bucket name registered in Nextcloud
+prefix = ""                     # optional key prefix inside the bucket
+max_retries = 8
+
+# Nextcloud is not a high-throughput object store and every part is buffered
+# server-side, so keep parts modest rather than the 64/32 MiB defaults.
+multipart_threshold = "32MiB"
+multipart_part_size = "8MiB"
+
+[store.s3]
+# Note the trailing slash: aws-sdk-rust does not add a separator before the
+# bucket name.
+endpoint = "https://home.osuv.de/apps/s3_api/s3/"
+region = "us-east-1"
+access_key_env = "AWS_ACCESS_KEY_ID"
+secret_key_env = "AWS_SECRET_ACCESS_KEY"
+force_path_style = true         # required: no per-bucket subdomains
+
+[server]
+listen = "127.0.0.1:8080"
+
+[cache]
+dir = "/tmp/walgit"
+
+[bundles]
+# Bundle URIs are composed in the bucket with UploadPartCopy, which works, but
+# the bytes still pass through the Nextcloud PHP process. Serve them by proxy
+# rather than handing clients presigned URLs.
+serve_via = "proxy"
+
+[lfs]
+serve_via = "proxy"

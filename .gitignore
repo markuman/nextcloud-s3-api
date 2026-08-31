@@ -4,7 +4,9 @@
 
 # Scratch files from manual testing
 /test.txt
-/settings.png
 
 # Assistant scratch state
 /.claude/
+
+# release artefacts
+/build/

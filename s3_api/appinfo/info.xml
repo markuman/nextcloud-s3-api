@@ -5,16 +5,53 @@
 	<name>S3 API</name>
 	<summary>Expose Nextcloud folders as S3-compatible buckets</summary>
 	<description><![CDATA[
-This app exposes Nextcloud folders as S3-compatible buckets.
-Users can mark folders as buckets in their personal settings and create API keys (readonly/readwrite) per bucket.
-The API is accessible via path-style S3 requests and supports AWS Signature V4 authentication.
+**Point any S3 client at a Nextcloud folder.**
+
+Mark a folder as a bucket in your personal settings, create an API key, and use it with the AWS
+CLI, boto3, rclone or any other S3-compatible client. The files stay ordinary Nextcloud files —
+visible in the web UI, synced by the desktop client, shareable, versioned. Nothing is duplicated
+into a separate object store.
+
+Rather than the handful of calls a file sync needs, this implements the parts that make an S3
+endpoint usable as a real backend:
+
+* Conditional writes (`If-Match` / `If-None-Match`) that serialise concurrent writers, so the
+  store works as a compare-and-swap primitive
+* Multipart uploads, including `UploadPartCopy` for server-side compose
+* Ranged and conditional reads, delimited listings, presigned URLs
+* Streaming uploads — bodies are never buffered in memory, and `aws-chunked` payloads have their
+  per-chunk signature chain verified
+* Correct S3 ETags (content MD5, compound form for multipart) rather than Nextcloud's internal
+  etag, which is too coarse to build a compare-and-swap on
+
+Authentication is AWS Signature V4, via header or presigned URL. Each API key is scoped to exactly
+one bucket and is either readonly or readwrite.
+
+Verified against [walgit](https://github.com/tobi/walgit)'s store contract suite, which exercises
+compare-and-swap under 32-way concurrency, ranged reads, delimited listings and multipart round
+trips.
+
+**Note:** every request passes through PHP and Nextcloud's storage layer. This is a convenient way
+to talk S3 to data you already keep in Nextcloud — not a replacement for a high-throughput object
+store.
 	]]></description>
 	<version>1.5.0</version>
-	<licence>agpl</licence>
-	<author>osuv</author>
+	<!-- SPDX identifier, required for apps targeting Nextcloud 31+ -->
+	<licence>AGPL-3.0-or-later</licence>
+	<author>Markus Bergholz</author>
 	<namespace>S3Api</namespace>
+	<!-- element order below is fixed by the XSD, not cosmetic -->
+	<documentation>
+		<admin>https://github.com/markuman/nextcloud-s3-api#readme</admin>
+	</documentation>
 	<category>files</category>
+	<category>integration</category>
+	<website>https://github.com/markuman/nextcloud-s3-api</website>
+	<bugs>https://github.com/markuman/nextcloud-s3-api/issues</bugs>
+	<repository type="git">https://github.com/markuman/nextcloud-s3-api</repository>
+	<screenshot>https://raw.githubusercontent.com/markuman/nextcloud-s3-api/main/s3_api/img/1-settings.png</screenshot>
 	<dependencies>
+		<php min-version="8.1"/>
 		<nextcloud min-version="30" max-version="34" />
 	</dependencies>
 	<background-jobs>
