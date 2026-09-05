@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
 
 ## [Unreleased]
 
+## 1.5.1 – 2026-09-05
+
+### Changed
+- First release published to the Nextcloud app store. No code changes: the app metadata gained the
+  `bugs` element the store requires, an SPDX licence identifier in place of the deprecated `agpl`
+  shorthand, and the element order the XSD prescribes — `info.xml` did not validate before. The
+  store also reads `CHANGELOG.md` and `LICENSE` from inside the archive, and neither existed at the
+  `v1.5.0` tag. Cutting a version rather than moving that tag leaves what `v1.5.0` points at
+  unchanged for anyone who already fetched it.
+
 ## 1.5.0 – 2026-08-26
 
 ### Fixed

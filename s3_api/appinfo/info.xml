@@ -35,7 +35,7 @@ trips.
 to talk S3 to data you already keep in Nextcloud — not a replacement for a high-throughput object
 store.
 	]]></description>
-	<version>1.5.0</version>
+	<version>1.5.1</version>
 	<!-- SPDX identifier, required for apps targeting Nextcloud 31+ -->
 	<licence>AGPL-3.0-or-later</licence>
 	<author>Markus Bergholz</author>
