@@ -89,13 +89,32 @@ class BucketMapper extends QBMapper {
 	}
 
 	/**
-	 * A path in one comparable shape: leading slash, no trailing slash.
+	 * A path in one comparable shape: leading slash, no trailing slash, no
+	 * empty, `.` or `..` segments.
 	 *
 	 * `Documents`, `/Documents` and `/Documents/` all name the same folder, and
-	 * the settings form accepts any of them.
+	 * the settings form accepts any of them. So do `/Documents//sub` and
+	 * `/Documents/./sub` — Nextcloud's own path handling collapses those, which
+	 * means such a spelling passes the folder-exists check. If it were compared
+	 * here verbatim it would slip past the overlap check while still naming the
+	 * same directory, so the same collapsing has to happen before comparing.
+	 * `..` is resolved the way Nextcloud resolves it too; it cannot climb above
+	 * the user's home because these paths are all relative to it.
 	 */
 	private function normalizePath(string $path): string {
-		return '/' . trim(str_replace('\\', '/', $path), '/');
+		$segments = [];
+		foreach (explode('/', str_replace('\\', '/', $path)) as $segment) {
+			if ($segment === '' || $segment === '.') {
+				continue;
+			}
+			if ($segment === '..') {
+				array_pop($segments);
+				continue;
+			}
+			$segments[] = $segment;
+		}
+
+		return '/' . implode('/', $segments);
 	}
 
 	/**
