@@ -6,9 +6,9 @@
 
 *No object store · No duplication · Your files stay files*
 
-[![Nextcloud 30–34](https://img.shields.io/badge/Nextcloud-30--34-0082c9)](https://nextcloud.com)
+[![Nextcloud 32–35](https://img.shields.io/badge/Nextcloud-32--35-0082c9)](https://nextcloud.com)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![PHP 8.1+](https://img.shields.io/badge/PHP-8.1%2B-777bb4)](https://www.php.net)
+[![PHP 8.3+](https://img.shields.io/badge/PHP-8.3%2B-777bb4)](https://www.php.net)
 
 <br>
 
@@ -94,7 +94,8 @@ API key. Note down both keys; the secret is shown once.
 
 <br>
 
-* Nextcloud 30–34, PHP 8.1+
+* Nextcloud 32–35, PHP 8.3+ — 8.3 is what Nextcloud 35 requires, and one declared minimum has to
+  cover the whole range, so it applies on 32–34 as well even though those ask for less
 * **Nextcloud's cron must run** — abandoned multipart uploads are only reclaimed by a background
   job
 * `app:enable` runs the migrations. `occ upgrade` is for core upgrades and will not touch an app.
