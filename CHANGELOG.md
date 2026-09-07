@@ -5,6 +5,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
 
 ## [Unreleased]
 
+## 1.5.3 – 2026-09-07
+
+### Fixed
+- **A conditional write took its lock on the wrong identity, so compare-and-swap could lose an
+  update.** The lock key hashed the bucket id, but one file can be reached through two buckets:
+  nothing stopped registering `/Documents` as `foo` and `/Documents/sub` as `bar`, after which
+  `foo/sub/x.txt` and `bar/x.txt` are the same file with two independent locks. Two concurrent
+  `If-None-Match: *` requests, one per bucket, would then both observe "absent" and both succeed —
+  exactly the silent lost update that content-derived ETags were introduced in 1.2.0 to prevent.
+  The lock is now keyed on the object's resolved storage path, which is what actually identifies
+  the file. Note that hashing the bucket's *folder* would not have been enough either: in the
+  example above the two buckets have different folders, and it is the full path of the object that
+  has to agree.
+- Registering a folder that another bucket already serves is refused, including the nesting case
+  above. Two names for one folder have no use that a single bucket with a key prefix does not cover
+  better, and they leave the app treating one directory as two buckets — separate multipart scratch
+  areas inside it, two ETag rows racing over one file id. Existing overlapping buckets are left
+  alone: they still work, and now share a lock correctly.
+- Creating a bucket whose name is already taken answers `409` with a readable message. It used to
+  hit the unique index and surface as a `500` carrying the raw driver error, for what is the most
+  ordinary mistake in that form. The index is still what decides — two racing requests can both
+  pass the pre-check — and that collision now maps to the same `409` rather than a `500`.
+- Unexpected failures while creating a bucket no longer return the exception message to the
+  browser; it could carry a filesystem path or driver detail. They are logged instead.
+
+### Changed
+- **PHP 8.2 is supported again**, down from the 8.3 that 1.5.2 briefly required. `<php
+  min-version>` is resolved against the server, so it has to be satisfiable on the oldest
+  Nextcloud in the range — and 32 (which asks for 8.1) through 34 (8.2) all run on 8.2. Nextcloud
+  35 does need 8.3, but it enforces that itself, so the lower floor costs its users nothing while
+  32–34 keep working on the PHP their Nextcloud actually asks for. Verified by linting on 8.1, 8.2
+  and 8.3; nothing in the app uses a language feature past 8.1, and 8.1 stays out only because it
+  is end of life.
+
 ## 1.5.2 – 2026-09-07
 
 ### Changed

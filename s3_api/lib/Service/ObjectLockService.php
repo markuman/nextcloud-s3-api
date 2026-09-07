@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\S3Api\Service;
 
 use OCP\DB\Exception as DbException;
+use OCP\Files\Folder;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
 
@@ -45,15 +46,27 @@ class ObjectLockService {
 	}
 
 	/**
-	 * Run `$operation` while holding the lock for `$bucketId`/`$objectKey`.
+	 * Run `$operation` while holding the lock for the file `$objectKey` names
+	 * inside `$bucketFolder`.
+	 *
+	 * Keyed on the resolved storage path rather than on the bucket id, because
+	 * the same file can be reached through more than one bucket: nothing stops
+	 * a user registering `/Documents` as `foo` and `/Documents/sub` as `bar`,
+	 * and then `foo/sub/x.txt` and `bar/x.txt` are one file. Hashing the bucket
+	 * id gave those two names separate locks, which silently voids the
+	 * mutual exclusion a conditional write depends on — two `If-None-Match: *`
+	 * requests, one per name, would both see "absent" and both succeed.
+	 *
+	 * The bucket's own path is not enough either, for the same reason in the
+	 * other direction: it is the full path of the *object* that has to agree.
 	 *
 	 * @template T
 	 * @param \Closure(): T $operation
 	 * @return T
 	 * @throws S3AuthException when the lock cannot be acquired in time
 	 */
-	public function withLock(int $bucketId, string $objectKey, \Closure $operation) {
-		$lockKey = hash('sha256', $bucketId . "\0" . $objectKey);
+	public function withLock(Folder $bucketFolder, string $objectKey, \Closure $operation) {
+		$lockKey = hash('sha256', $this->pathFor($bucketFolder, $objectKey));
 
 		$this->acquire($lockKey, $objectKey);
 		try {
@@ -61,6 +74,20 @@ class ObjectLockService {
 		} finally {
 			$this->release($lockKey);
 		}
+	}
+
+	/**
+	 * The absolute storage path a key resolves to.
+	 *
+	 * Built by concatenation rather than by asking the file for its path: the
+	 * object usually does not exist yet — `If-None-Match: *` is precisely the
+	 * case where it must not — so there is nothing to look up. The bucket
+	 * folder does exist and its path is already normalised by Nextcloud, and
+	 * the key has been through isUsableKey(), which rejects `.`, `..` and
+	 * empty segments. So the join cannot escape the folder.
+	 */
+	private function pathFor(Folder $bucketFolder, string $objectKey): string {
+		return rtrim($bucketFolder->getPath(), '/') . '/' . $objectKey;
 	}
 
 	/**
