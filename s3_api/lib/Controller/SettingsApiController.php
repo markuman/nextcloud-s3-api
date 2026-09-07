@@ -5,13 +5,16 @@ declare(strict_types=1);
 namespace OCA\S3Api\Controller;
 
 use OCA\S3Api\Service\ApiKeyService;
+use OCA\S3Api\Service\BucketConflictException;
 use OCA\S3Api\Service\BucketService;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\Attribute\NoAdminRequired;
 use OCP\AppFramework\Http\JSONResponse;
+use OCP\DB\Exception as DbException;
 use OCP\IRequest;
+use Psr\Log\LoggerInterface;
 
 class SettingsApiController extends Controller {
 
@@ -20,6 +23,7 @@ class SettingsApiController extends Controller {
 		IRequest $request,
 		private BucketService $bucketService,
 		private ApiKeyService $apiKeyService,
+		private LoggerInterface $logger,
 		private ?string $userId,
 	) {
 		parent::__construct($appName, $request);
@@ -45,8 +49,27 @@ class SettingsApiController extends Controller {
 			return new JSONResponse($bucket->jsonSerialize(), Http::STATUS_CREATED);
 		} catch (\InvalidArgumentException $e) {
 			return new JSONResponse(['error' => $e->getMessage()], Http::STATUS_BAD_REQUEST);
+		} catch (BucketConflictException $e) {
+			return new JSONResponse(['error' => $e->getMessage()], Http::STATUS_CONFLICT);
+		} catch (DbException $e) {
+			// The service checks for a duplicate name first, so reaching the
+			// index means two requests raced. Same conflict, same answer — and
+			// notably not a 500 with the driver's message in it, which is what
+			// this used to do for the far more common non-racing case.
+			if ($e->getReason() === DbException::REASON_UNIQUE_CONSTRAINT_VIOLATION) {
+				return new JSONResponse(
+					['error' => 'A bucket named "' . $bucketName . '" already exists'],
+					Http::STATUS_CONFLICT,
+				);
+			}
+
+			$this->logger->error('Failed to create S3 bucket', ['app' => 's3_api', 'exception' => $e]);
+			return new JSONResponse(['error' => 'Failed to create bucket'], Http::STATUS_INTERNAL_SERVER_ERROR);
 		} catch (\Exception $e) {
-			return new JSONResponse(['error' => 'Failed to create bucket: ' . $e->getMessage()], Http::STATUS_INTERNAL_SERVER_ERROR);
+			// Nothing here should reach the client: an unexpected failure could
+			// carry a path or a driver detail in its message.
+			$this->logger->error('Failed to create S3 bucket', ['app' => 's3_api', 'exception' => $e]);
+			return new JSONResponse(['error' => 'Failed to create bucket'], Http::STATUS_INTERNAL_SERVER_ERROR);
 		}
 	}
 

@@ -41,6 +41,64 @@ class BucketMapper extends QBMapper {
 	}
 
 	/**
+	 * Buckets of a user whose folder path is `$folderPath`, or is nested inside
+	 * it, or contains it.
+	 *
+	 * Used to keep one file from being reachable through two buckets, which
+	 * would give it two independent locks. Matching is done in PHP rather than
+	 * with a `LIKE` prefix query: the paths are per user and few, and `LIKE`
+	 * would need `_` and `%` escaped, which is easy to get subtly wrong.
+	 *
+	 * @return Bucket[]
+	 */
+	public function findOverlapping(string $userId, string $folderPath): array {
+		$needle = $this->normalizePath($folderPath);
+
+		return array_values(array_filter(
+			$this->findByUserId($userId),
+			function (Bucket $bucket) use ($needle): bool {
+				return $this->pathsOverlap($this->normalizePath($bucket->getFolderPath()), $needle);
+			},
+		));
+	}
+
+	/**
+	 * Whether two normalised paths name the same folder or one contains the
+	 * other.
+	 *
+	 * Comparison is on whole segments — `/Documents` and `/Documents2` share a
+	 * string prefix but are unrelated folders, so a plain str_starts_with on
+	 * the bare paths would be wrong. Appending the separator to both sides is
+	 * what makes the boundary explicit.
+	 */
+	private function pathsOverlap(string $a, string $b): bool {
+		if ($a === $b) {
+			return true;
+		}
+
+		// The home root contains every path, and normalises to "/" — for which
+		// the trailing-separator trick degenerates into "//" and matches
+		// nothing. Special-cased rather than papered over, because a bucket on
+		// the whole home is a legitimate thing to have registered.
+		if ($a === '/' || $b === '/') {
+			return true;
+		}
+
+		return str_starts_with($a . '/', $b . '/')
+			|| str_starts_with($b . '/', $a . '/');
+	}
+
+	/**
+	 * A path in one comparable shape: leading slash, no trailing slash.
+	 *
+	 * `Documents`, `/Documents` and `/Documents/` all name the same folder, and
+	 * the settings form accepts any of them.
+	 */
+	private function normalizePath(string $path): string {
+		return '/' . trim(str_replace('\\', '/', $path), '/');
+	}
+
+	/**
 	 * @throws DoesNotExistException
 	 */
 	public function findByIdAndUser(int $id, string $userId): Bucket {

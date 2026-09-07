@@ -35,7 +35,7 @@ trips.
 to talk S3 to data you already keep in Nextcloud — not a replacement for a high-throughput object
 store.
 	]]></description>
-	<version>1.5.2</version>
+	<version>1.5.3</version>
 	<!-- SPDX identifier, required for apps targeting Nextcloud 31+ -->
 	<licence>AGPL-3.0-or-later</licence>
 	<author>Markus Bergholz</author>
@@ -57,17 +57,19 @@ store.
 	-->
 	<screenshot>https://raw.githubusercontent.com/markuman/nextcloud-s3-api/latest/s3_api/img/1-settings.png</screenshot>
 	<!--
-		Nextcloud 35 requires PHP 8.3, so the upper end of the range dictates
-		the floor: the store resolves this against the server, not against
-		Nextcloud's own minimum, so one value has to cover all four versions.
-		32 asks for 8.1 and 33/34 for 8.2, which means their users need a PHP
-		newer than their Nextcloud demands — a deliberate narrowing, not an
-		oversight: one tested interpreter beats three untested ones, and 8.1
-		is out of security support anyway. Nothing in lib/ needs a feature
-		past 8.1; this bounds what is tested, not what parses.
+		8.2 is the floor rather than 8.3: <php min-version> is resolved against
+		the server, so it has to be satisfiable on the *oldest* Nextcloud in
+		the range. 32 asks for 8.1 and 33/34 for 8.2, so all three run on 8.2
+		happily; demanding 8.3 there locked out installations for nothing.
+		Nothing in lib/ uses a feature past 8.1, verified by linting on 8.1,
+		8.2 and 8.3. 8.1 itself stays out because it is past end of life.
+
+		Nextcloud 35 needs 8.3, but it enforces that itself: an admin cannot
+		run 35 on 8.2 regardless of what this file says. So the low floor
+		costs the 35 users nothing.
 	-->
 	<dependencies>
-		<php min-version="8.3"/>
+		<php min-version="8.2"/>
 		<nextcloud min-version="32" max-version="35" />
 	</dependencies>
 	<background-jobs>

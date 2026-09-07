@@ -304,7 +304,7 @@ class S3Controller extends Controller {
 			// CopyObject is a PUT that names a source instead of sending a body.
 			// Treating it as a plain PUT would truncate the target to nothing.
 			$method === 'PUT' && $copySource !== '' => $this->copyObject($bucketFolder, $bucketName, $objectKey, $copySource, $permission),
-			$method === 'PUT' => $this->putObject($bucket, $bucketFolder, $objectKey, $bucketName, $permission),
+			$method === 'PUT' => $this->putObject($bucketFolder, $objectKey, $bucketName, $permission),
 			$method === 'DELETE' => $this->deleteObject($bucketFolder, $objectKey, $bucketName, $permission),
 			default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
 		};
@@ -588,7 +588,7 @@ class S3Controller extends Controller {
 		return [$start, $end];
 	}
 
-	private function putObject($bucket, Folder $bucketFolder, string $objectKey, string $bucketName, string $permission): Response {
+	private function putObject(Folder $bucketFolder, string $objectKey, string $bucketName, string $permission): Response {
 		if ($permission !== 'readwrite') {
 			return $this->errorResponse('AccessDenied', 'Write access denied', '/' . $bucketName . '/' . $objectKey, Http::STATUS_FORBIDDEN);
 		}
@@ -639,7 +639,7 @@ class S3Controller extends Controller {
 			// concurrent `If-None-Match: *` requests both see "absent" and both
 			// succeed -- a silently lost update for a client using this for
 			// compare-and-swap.
-			return $this->objectLock->withLock($bucket->getId(), $objectKey, $write);
+			return $this->objectLock->withLock($bucketFolder, $objectKey, $write);
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		} catch (LockedException) {
