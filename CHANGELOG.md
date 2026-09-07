@@ -22,7 +22,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
   above. Two names for one folder have no use that a single bucket with a key prefix does not cover
   better, and they leave the app treating one directory as two buckets — separate multipart scratch
   areas inside it, two ETag rows racing over one file id. Existing overlapping buckets are left
-  alone: they still work, and now share a lock correctly.
+  alone: they still work, and now share a lock correctly. The comparison normalizes the path first,
+  because `/Documents//sub`, `/Documents/./sub` and `/Documents/other/../sub` all pass the
+  folder-exists check — Nextcloud collapses those itself — and would otherwise have slipped past
+  the overlap check while naming a folder that is already served.
 - Creating a bucket whose name is already taken answers `409` with a readable message. It used to
   hit the unique index and surface as a `500` carrying the raw driver error, for what is the most
   ordinary mistake in that form. The index is still what decides — two racing requests can both
