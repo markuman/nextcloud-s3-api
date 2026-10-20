@@ -3,7 +3,16 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased]
+## 1.5.4 – 2026-10-20
+
+### Fixed
+- **Deleting a key that names a folder moved the whole folder to the trash.** `DeleteObject` and
+  the bulk `DeleteObjects` resolved the key and called `delete()` on whatever node came back,
+  without checking that it was a file. A `DELETE` on `repos` — while `repos/a`, `repos/b`, … exist
+  — therefore removed the entire tree. Keys with a trailing slash were already rejected, but the
+  bare prefix was not. In S3, `repos` does not exist just because `repos/a` does, so such a delete
+  is now a no-op that answers `204` (or lists the key as deleted in a bulk request), matching what
+  a missing key does. Reads already refused folders this way.
 
 ## 1.5.3 – 2026-09-07
 

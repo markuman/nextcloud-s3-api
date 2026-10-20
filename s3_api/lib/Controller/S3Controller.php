@@ -775,11 +775,16 @@ class S3Controller extends Controller {
 
 		try {
 			$node = $bucketFolder->get($objectKey);
-			$fileId = $node->getId();
-			$node->delete();
-			// Drop the recorded ETag: file ids are reused, so a stale row would
-			// otherwise be served for a different object.
-			$this->etagService->forget($fileId);
+			// A folder is not an object: in S3, "a" does not exist just because
+			// "a/b" does, so deleting it is a no-op. Calling delete() here would
+			// move the whole tree to the trash.
+			if ($node instanceof File) {
+				$fileId = $node->getId();
+				$node->delete();
+				// Drop the recorded ETag: file ids are reused, so a stale row
+				// would otherwise be served for a different object.
+				$this->etagService->forget($fileId);
+			}
 		} catch (NotFoundException) {
 			// S3 returns 204 even if object doesn't exist
 		}
@@ -1313,9 +1318,13 @@ class S3Controller extends Controller {
 
 			try {
 				$node = $bucketFolder->get($key);
-				$fileId = $node->getId();
-				$node->delete();
-				$this->etagService->forget($fileId);
+				// Same as DeleteObject: a folder is not an object, so it is
+				// reported as deleted without touching it.
+				if ($node instanceof File) {
+					$fileId = $node->getId();
+					$node->delete();
+					$this->etagService->forget($fileId);
+				}
 				$deleted[] = $key;
 			} catch (NotFoundException) {
 				// Deleting a missing key is a success in S3.
