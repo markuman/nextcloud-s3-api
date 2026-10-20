@@ -3,6 +3,34 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+- **An integration test suite** (`tests/`). `tests/run.sh` starts a throwaway Nextcloud in a
+  container, enables the app and runs pytest against the real endpoint: SigV4 and presigned URLs,
+  conditional writes under concurrency, listings and pagination, ranged reads, multipart and
+  `UploadPartCopy`, `aws-chunked` bodies with tampered chunk signatures, read-only keys, and the
+  settings API. It also drives [gits3](https://github.com/markuman/gits3srv) — its own S3 client
+  and a real push / clone / gc cycle through it — when `gits3.py` is found next to this repository.
+  Not part of the release tarball.
+- `NC_VERSION=master tests/run.sh` runs the suite against Nextcloud's daily master build — the
+  next major before it has an image — by swapping the daily tarball into the newest stable image.
+
+### Changed
+- **Nextcloud 36 is in the supported range** ahead of its release: `max-version` moves from 35 to
+  36. A major upgrade disables every app whose `max-version` is below the new server, so declaring
+  it only after 36 ships would switch the app off for everyone upgrading on day one. No code
+  changes were needed. Checked against the daily master build (36.0.0 dev): all OCP classes this
+  app uses still exist and none is deprecated, no deprecated method is called, `info.xml` validates
+  against master's schema (unchanged since `stable35`), the code lints clean under PHP 8.5 with
+  `E_ALL`, the full test suite passes, and the server logs no deprecation for the app while it
+  runs.
+
+### Known issues
+- A key with an empty segment such as `a//b` is not rejected: Nextcloud's router collapses the
+  `//` before the request reaches the app, so it silently addresses `a/b`. Covered by an expected
+  failure in the suite.
+
 ## 1.5.4 – 2026-10-20
 
 ### Fixed

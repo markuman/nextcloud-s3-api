@@ -6,7 +6,7 @@
 
 *No object store · No duplication · Your files stay files*
 
-[![Nextcloud 32–35](https://img.shields.io/badge/Nextcloud-32--35-0082c9)](https://nextcloud.com)
+[![Nextcloud 32–36](https://img.shields.io/badge/Nextcloud-32--36-0082c9)](https://nextcloud.com)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![PHP 8.2+](https://img.shields.io/badge/PHP-8.2%2B-777bb4)](https://www.php.net)
 
@@ -94,8 +94,9 @@ API key. Note down both keys; the secret is shown once.
 
 <br>
 
-* Nextcloud 32–35, PHP 8.2+ — Nextcloud 35 needs 8.3, but enforces that itself, so the app's own
-  floor only has to suit the older end of the range
+* Nextcloud 32–36, PHP 8.2+ — Nextcloud 35 and 36 need 8.3, but enforce that themselves, so the
+  app's own floor only has to suit the older end of the range. 36 is declared ahead of its
+  release and tested against the daily master build
 * **Nextcloud's cron must run** — abandoned multipart uploads are only reclaimed by a background
   job
 * `app:enable` runs the migrations. `occ upgrade` is for core upgrades and will not touch an app.
@@ -330,6 +331,29 @@ Each API key is bound to **exactly one bucket** and is either `readonly` or `rea
 ---
 
 ## 🛠️ Development
+
+<details>
+<summary><b>Running the tests</b></summary>
+
+<br>
+
+```bash
+tests/run.sh                         # Nextcloud 34, throwaway container
+NC_VERSION=35 tests/run.sh -k multipart -x
+NC_VERSION=master tests/run.sh       # next major, built from the daily tarball
+KEEP=1 tests/run.sh                  # keep the container, reuse it next run
+```
+
+Needs `podman` (or `ENGINE=docker`), `curl` and `uv`. The script starts the official
+`nextcloud:<version>-apache` image with SQLite, mounts `s3_api/` read-only, enables the app and
+runs the pytest suite in `tests/` against `http://127.0.0.1:18080`. Buckets and keys are created by
+the suite itself through the settings API.
+
+The gits3 tests run [gits3](https://github.com/markuman/gits3srv)'s own S3 client and a real
+push / clone / gc cycle through it. They look for `../gits3srv/gits3.py` (override with
+`GITS3=…`) and are skipped when it is missing.
+
+</details>
 
 <details>
 <summary><b>Publishing a release to the Nextcloud App Store</b></summary>

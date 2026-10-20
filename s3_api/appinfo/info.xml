@@ -64,13 +64,19 @@ store.
 		Nothing in lib/ uses a feature past 8.1, verified by linting on 8.1,
 		8.2 and 8.3. 8.1 itself stays out because it is past end of life.
 
-		Nextcloud 35 needs 8.3, but it enforces that itself: an admin cannot
-		run 35 on 8.2 regardless of what this file says. So the low floor
-		costs the 35 users nothing.
+		Nextcloud 35 and 36 need 8.3, but they enforce that themselves: an
+		admin cannot run them on 8.2 regardless of what this file says. So
+		the low floor costs their users nothing.
+
+		36 is in the range before its release on purpose: a major upgrade
+		disables every app whose max-version is below the new server, so
+		waiting for 36 to ship would switch the app off for everyone who
+		upgrades on day one. Checked against the daily master build with
+		`NC_VERSION=master tests/run.sh`.
 	-->
 	<dependencies>
 		<php min-version="8.2"/>
-		<nextcloud min-version="32" max-version="35" />
+		<nextcloud min-version="32" max-version="36" />
 	</dependencies>
 	<background-jobs>
 		<job>OCA\S3Api\BackgroundJob\CleanupJob</job>

@@ -10,3 +10,7 @@
 
 # release artefacts
 /build/
+
+# test suite
+__pycache__/
+/tests/.pytest_cache/
