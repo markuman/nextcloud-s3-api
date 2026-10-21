@@ -45,6 +45,18 @@ def test_unsigned_trailer_framing(s3, bucket, prefix, trailer):
     assert s3.get(bucket, prefix + "obj").body == b"hello world"
 
 
+@pytest.mark.parametrize("declared,final", [(5, True), (500, True), (500, False)],
+                         ids=["shorter", "longer", "cut-short"])
+def test_decoded_length_is_enforced(s3, bucket, prefix, declared, final):
+    """`x-amz-decoded-content-length` is the object's size; a body that does
+    not match it -- including one cut off before its final chunk, which an
+    unsigned body may otherwise omit -- is incomplete."""
+    r = s3.put_chunked_unsigned(bucket, prefix + "obj", [b"hello ", b"world"], decoded=declared, final=final)
+    assert r.status == 400
+    assert r.error_code == "IncompleteBody"
+    assert s3.get(bucket, prefix + "obj").status == 404
+
+
 def test_malformed_chunk_header(s3, bucket, prefix):
     body = b"zz\r\nabc\r\n0\r\n\r\n"
     r = s3.request("PUT", bucket, prefix + "obj", body, payload_hash="STREAMING-UNSIGNED-PAYLOAD-TRAILER",

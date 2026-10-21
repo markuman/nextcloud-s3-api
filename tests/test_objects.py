@@ -122,6 +122,34 @@ def test_unusable_keys_are_rejected(s3, bucket, prefix, suffix):
     assert r.error_code == "InvalidArgument"
 
 
+def test_backslash_is_not_a_second_separator(s3, bucket, prefix):
+    """Nextcloud reads `\\` as `/`, so `a\\b` would alias `a/b` under a lock
+    of its own."""
+    s3.put(bucket, prefix + "a/b", b"keep")
+    r = s3.put(bucket, prefix + "a\\b", b"overwrite")
+    assert r.status == 400
+    assert r.error_code == "InvalidArgument"
+    assert s3.get(bucket, prefix + "a/b").body == b"keep"
+
+
+def test_key_length_limit(s3, bucket, prefix):
+    """1024 bytes, as on S3."""
+    r = s3.put(bucket, prefix + "/".join(["d" * 100] * 10) + "/" + "x" * 50, b"x")
+    assert r.status == 400
+    assert r.error_code == "KeyTooLongError"
+
+
+@pytest.mark.parametrize("name,status,code", [
+    ("n" * 300, 400, "InvalidArgument"),
+    (".htaccess", 403, "AccessDenied"),
+], ids=["long-segment", "reserved-name"])
+def test_names_nextcloud_refuses_are_client_errors(s3, bucket, prefix, name, status, code):
+    """Names Nextcloud will not store are the client's problem, not a 500."""
+    r = s3.put(bucket, prefix + name, b"x")
+    assert r.status == status, r.body
+    assert r.error_code == code
+
+
 def test_key_with_leading_slash_is_rejected(s3, bucket, prefix):
     """`bucket//x` addresses the key `/x`, which has an empty first segment."""
     s3.put(bucket, prefix + "x", b"keep")
@@ -174,6 +202,16 @@ def test_get_on_a_folder_is_no_such_key(s3, bucket, prefix):
     assert r.status == 404
     assert r.error_code == "NoSuchKey"
     assert s3.head(bucket, prefix + "dir").status == 404
+
+
+@pytest.mark.parametrize("name,attachment", [("page.html", True), ("pic.svg", True), ("notes.txt", False)])
+def test_active_content_is_served_as_download(s3, bucket, prefix, name, attachment):
+    """A presigned URL opens on the Nextcloud origin; HTML or SVG rendered
+    there could pose as a login page."""
+    s3.put(bucket, prefix + name, b"<html><form></form></html>")
+    r = s3.get(bucket, prefix + name)
+    assert r.header("x-content-type-options") == "nosniff"
+    assert (r.header("content-disposition") == "attachment") is attachment
 
 
 # ---- files written outside the API ------------------------------------------

@@ -112,7 +112,7 @@ class CleanupService {
 				->setMaxResults(5000);
 
 			$result = $qb->executeQuery();
-			$orphans = array_map('intval', $result->fetchAll(\PDO::FETCH_COLUMN));
+			$orphans = array_map('intval', $result->fetchFirstColumn());
 			$result->closeCursor();
 		} catch (\Throwable $e) {
 			$this->logger->warning('Could not look for orphaned S3 ETags', [

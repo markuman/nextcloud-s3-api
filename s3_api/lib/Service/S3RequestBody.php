@@ -39,6 +39,11 @@ use OCP\IRequest;
  */
 class S3RequestBody {
 
+	public function __construct(
+		private TempFiles $tempFiles,
+	) {
+	}
+
 	/** Read buffer size for body copies. */
 	private const CHUNK = 1024 * 1024;
 
@@ -120,12 +125,13 @@ class S3RequestBody {
 			throw new S3AuthException('InternalError', 'Cannot read request body', Http::STATUS_INTERNAL_SERVER_ERROR);
 		}
 
-		$out = fopen('php://temp/maxmemory:' . (8 * 1024 * 1024), 'w+b');
-		if ($out === false) {
+		try {
+			$out = $this->tempFiles->open();
+		} catch (S3AuthException $e) {
 			if ($ownsInput) {
 				fclose($input);
 			}
-			throw new S3AuthException('InternalError', 'Cannot buffer request body', Http::STATUS_INTERNAL_SERVER_ERROR);
+			throw $e;
 		}
 
 		$hashCtx = hash_init('sha256');
@@ -133,6 +139,7 @@ class S3RequestBody {
 		try {
 			if ($this->isChunked($request)) {
 				$this->copyChunked($input, $out, $hashCtx, $verifier);
+				$this->assertDecodedLength($request, ftell($out));
 			} else {
 				$this->copyRaw($input, $out, $hashCtx);
 			}
@@ -151,6 +158,33 @@ class S3RequestBody {
 		$sha256 = hash_final($hashCtx);
 		rewind($out);
 		return $out;
+	}
+
+	/**
+	 * Hold an `aws-chunked` body to the size its sender declared.
+	 *
+	 * For a plain body the web server enforces `Content-Length`; with the
+	 * chunked framing that header describes the framed bytes, and
+	 * `x-amz-decoded-content-length` is the only statement of the object's
+	 * size. An unsigned chunked body may also end without its zero-length
+	 * chunk and still be accepted, so this check is what catches one that was
+	 * cut short.
+	 *
+	 * @throws S3AuthException
+	 */
+	private function assertDecodedLength(IRequest $request, int|false $written): void {
+		$declared = (string)$request->getHeader('x-amz-decoded-content-length');
+		if ($declared === '' || !ctype_digit($declared)) {
+			return;
+		}
+
+		if ((int)$declared !== $written) {
+			throw new S3AuthException(
+				'IncompleteBody',
+				'The decoded body does not have the length given in x-amz-decoded-content-length',
+				Http::STATUS_BAD_REQUEST,
+			);
+		}
 	}
 
 	/**

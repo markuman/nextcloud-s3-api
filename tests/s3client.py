@@ -2,8 +2,8 @@
 
 boto3 hides exactly the things these tests need to control: which headers get
 signed, the payload hash, the request date, malformed or tampered bodies. This
-client signs the way gits3 does (path-style, `host;x-amz-content-sha256;
-x-amz-date`, literal payload hash) and exposes every knob as an argument.
+client signs the way gits3 does (path-style, `host` plus the `x-amz-*`
+headers, literal payload hash) and exposes every knob as an argument.
 """
 import datetime
 import hashlib
@@ -87,7 +87,9 @@ class S3Client:
         """Return the Authorization header value and the signature."""
         region = region or self.region
         lower = {k.lower(): str(v).strip() for k, v in headers.items()}
-        signed = sorted(signed or ["host", "x-amz-content-sha256", "x-amz-date"])
+        # Like every SDK: host plus all x-amz-* headers. gits3 sends no other
+        # x-amz-* header, so for it this is exactly its fixed list.
+        signed = sorted(signed or ["host"] + [h for h in lower if h.startswith("x-amz-")])
         canonical_headers = "".join(f"{h}:{lower.get(h, '')}\n" for h in signed)
         creq = "\n".join([method, uri, cq, canonical_headers, ";".join(signed), payload_hash])
         scope = f"{amz_date[:8]}/{region}/s3/aws4_request"
@@ -211,12 +213,19 @@ class S3Client:
             body += f"{len(sent):x};chunk-signature={sig}\r\n".encode() + sent + b"\r\n"
         return self.send("PUT", uri, body, h)
 
-    def put_chunked_unsigned(self, bucket, key, chunks, trailer=None):
+    def put_chunked_unsigned(self, bucket, key, chunks, trailer=None, decoded=None, final=True):
         """PutObject with `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, the framing the
-        current AWS SDKs default to."""
+        current AWS SDKs default to. `decoded` overrides the declared length,
+        `final=False` leaves out the terminating zero-length chunk."""
         payload_hash = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
-        decoded = sum(len(c) for c in chunks)
-        body = b"".join(f"{len(c):x}\r\n".encode() + c + b"\r\n" for c in chunks) + b"0\r\n"
+        if decoded is None:
+            decoded = sum(len(c) for c in chunks)
+        body = b"".join(f"{len(c):x}\r\n".encode() + c + b"\r\n" for c in chunks)
+        if not final:
+            return self.request("PUT", bucket, key, body, payload_hash=payload_hash,
+                                headers={"Content-Encoding": "aws-chunked",
+                                         "x-amz-decoded-content-length": str(decoded)})
+        body += b"0\r\n"
         headers = {"Content-Encoding": "aws-chunked", "x-amz-decoded-content-length": str(decoded)}
         if trailer:
             name, value = trailer

@@ -7,6 +7,7 @@ namespace OCA\S3Api\Service;
 use OCA\S3Api\Db\BucketMapper;
 use OCP\AppFramework\Http;
 use OCP\IRequest;
+use OCP\IUserManager;
 
 /**
  * AWS Signature Version 4 verification.
@@ -31,7 +32,44 @@ class S3AuthService {
 	public function __construct(
 		private ApiKeyService $apiKeyService,
 		private BucketMapper $bucketMapper,
+		private IUserManager $userManager,
 	) {
+	}
+
+	/**
+	 * Refuse a request carrying `x-amz-*` headers it did not sign, or that
+	 * did not sign `host`, as AWS does.
+	 *
+	 * Those headers change what a request does — `x-amz-copy-source` turns a
+	 * PUT into a copy of another object, `x-amz-copy-source-range` picks the
+	 * bytes, `x-amz-decoded-content-length` how many are expected. Left
+	 * unsigned, anyone able to alter a request in flight (a TLS-terminating
+	 * proxy, the case the chunk signature check exists for) could add one to a
+	 * captured, validly signed request. Every SDK signs all of them, so this
+	 * costs real clients nothing.
+	 *
+	 * Read from `$_SERVER`: IRequest can look up a header by name, but not
+	 * list them.
+	 *
+	 * @param string[] $signedHeaders lower-case
+	 * @throws S3AuthException
+	 */
+	private function assertHeadersSigned(IRequest $request, array $signedHeaders): void {
+		$unsigned = !in_array('host', $signedHeaders, true);
+
+		foreach (array_keys($_SERVER) as $name) {
+			if (!is_string($name) || !str_starts_with($name, 'HTTP_X_AMZ_')) {
+				continue;
+			}
+			$header = strtolower(str_replace('_', '-', substr($name, 5)));
+			if (!in_array($header, $signedHeaders, true)) {
+				$unsigned = true;
+			}
+		}
+
+		if ($unsigned) {
+			throw new S3AuthException('AccessDenied', 'There were headers present in the request which were not signed');
+		}
 	}
 
 	/**
@@ -46,10 +84,16 @@ class S3AuthService {
 			: $this->parseHeaderAuth((string)$request->getHeader('Authorization'));
 
 		$apiKey = $this->apiKeyService->findByAccessKey($parsed['accessKey']);
-		if ($apiKey === null) {
+		// A disabled account keeps its rows, but must lose access along with
+		// its login. Nothing on the way to the files checks that:
+		// IRootFolder::getUserFolder() serves a disabled user's folder just the
+		// same. Answered like an unknown key, so the reply does not tell a
+		// holder of a stale key why it stopped working.
+		if ($apiKey === null || $this->userManager->get($apiKey->getUserId())?->isEnabled() !== true) {
 			throw new S3AuthException('InvalidAccessKeyId', 'The access key ID you provided does not exist in our records');
 		}
 
+		$this->assertHeadersSigned($request, $parsed['signedHeaders']);
 		$this->assertFreshness($request, $parsed);
 
 		$secretKey = $this->apiKeyService->decryptSecretKey($apiKey);
@@ -384,7 +428,9 @@ class S3AuthService {
 
 		$parts = [];
 		foreach ($query as $key => $value) {
-			$parts[] = rawurlencode($key) . '=' . rawurlencode($value);
+			// A numeric name such as `?123=x` comes back from the array as an
+			// int, which rawurlencode() refuses under strict_types.
+			$parts[] = rawurlencode((string)$key) . '=' . rawurlencode($value);
 		}
 		sort($parts);
 

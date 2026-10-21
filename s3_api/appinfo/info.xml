@@ -59,10 +59,13 @@ store.
 	<!--
 		8.2 is the floor rather than 8.3: <php min-version> is resolved against
 		the server, so it has to be satisfiable on the *oldest* Nextcloud in
-		the range. 32 asks for 8.1 and 33/34 for 8.2, so all three run on 8.2
-		happily; demanding 8.3 there locked out installations for nothing.
-		Nothing in lib/ uses a feature past 8.1, verified by linting on 8.1,
-		8.2 and 8.3. 8.1 itself stays out because it is past end of life.
+		the range. 33 and 34 ask for 8.2 and run on it happily; demanding 8.3
+		there would lock out installations for nothing. Nothing in lib/ uses a
+		language feature past 8.1, verified by linting on 8.2, 8.4 and 8.5.
+
+		33 is the floor because the app uses IResult::fetchAssociative() and
+		fetchFirstColumn(), which arrived in 33 and replace the PDO-flavoured
+		fetch()/fetchAll() Nextcloud is moving away from.
 
 		Nextcloud 35 and 36 need 8.3, but they enforce that themselves: an
 		admin cannot run them on 8.2 regardless of what this file says. So
@@ -76,7 +79,7 @@ store.
 	-->
 	<dependencies>
 		<php min-version="8.2"/>
-		<nextcloud min-version="32" max-version="36" />
+		<nextcloud min-version="33" max-version="36" />
 	</dependencies>
 	<background-jobs>
 		<job>OCA\S3Api\BackgroundJob\CleanupJob</job>

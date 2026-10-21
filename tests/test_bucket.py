@@ -18,7 +18,7 @@ def test_list_buckets_via_boto3(boto, env):
 
 def test_head_bucket(s3, env):
     assert s3.head(env.main.name).status == 200
-    assert s3.head(env.other.name).status == 403
+    assert s3.head(env.other.name).status == 404
     assert s3.head("no-such-bucket-here").status == 404
 
 

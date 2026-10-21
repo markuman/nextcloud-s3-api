@@ -15,8 +15,10 @@ use OCA\S3Api\Service\S3AuthException;
 use OCA\S3Api\Service\S3AuthService;
 use OCA\S3Api\Service\S3RequestBody;
 use OCA\S3Api\Service\S3ResponseBuilder;
+use OCA\S3Api\Service\TempFiles;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Http;
+use OCP\AppFramework\Http\Attribute\BruteForceProtection;
 use OCP\AppFramework\Http\Attribute\NoCSRFRequired;
 use OCP\AppFramework\Http\Attribute\PublicPage;
 use OCP\AppFramework\Http\DataDisplayResponse;
@@ -24,13 +26,35 @@ use OCP\AppFramework\Http\Response;
 use OCP\AppFramework\Http\StreamResponse;
 use OCP\Files\File;
 use OCP\Files\Folder;
+use OCP\Files\ForbiddenException;
+use OCP\Files\InvalidPathException;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
 use OCP\IRequest;
 use OCP\Lock\LockedException;
 use Psr\Log\LoggerInterface;
 
 class S3Controller extends Controller {
+
+	/** S3's limit on a key, in UTF-8 bytes. */
+	private const MAX_KEY_BYTES = 1024;
+
+	/** The longest file or folder name a filesystem takes, in bytes. */
+	private const MAX_NAME_BYTES = 255;
+
+	/** S3's limit on the keys in one DeleteObjects request. */
+	private const MAX_DELETE_KEYS = 1000;
+
+	/**
+	 * Brute force protection bucket for failed credentials. Nextcloud delays
+	 * further requests from an address that keeps failing, per action, so
+	 * this slows guessing at keys without touching the login's own counter.
+	 */
+	private const THROTTLE_ACTION = 's3_api_auth';
+
+	/** Auth failures that are a wrong guess, as opposed to a stale clock. */
+	private const THROTTLED_CODES = ['InvalidAccessKeyId', 'SignatureDoesNotMatch'];
 
 	/**
 	 * Chunk signature chain for this request, when it carries signed chunks.
@@ -51,6 +75,7 @@ class S3Controller extends Controller {
 		private EtagService $etagService,
 		private MultipartService $multipartService,
 		private ObjectLockService $objectLock,
+		private TempFiles $tempFiles,
 		private IRootFolder $rootFolder,
 		private LoggerInterface $logger,
 	) {
@@ -59,42 +84,49 @@ class S3Controller extends Controller {
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function listBucketsOrRoot(): Response {
 		return $this->handleRequest('');
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function handleGet(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function handlePut(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function handleDelete(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function handlePost(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function handleHead(string $path = ''): Response {
 		return $this->handleRequest($path);
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
+	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function handleHeadRoot(): Response {
 		return $this->handleRequest('');
 	}
@@ -108,6 +140,15 @@ class S3Controller extends Controller {
 			// Nextcloud's locking surfaces as 423, which S3 clients treat as a
 			// permanent failure. 503 is the retryable equivalent.
 			$response = $this->errorResponse('SlowDown', 'The resource is locked, please retry', '/' . $path, Http::STATUS_SERVICE_UNAVAILABLE);
+		} catch (InvalidPathException) {
+			// A name Nextcloud will not store: too long for one path segment, a
+			// reserved name, a character the admin has forbidden.
+			$response = $this->errorResponse('InvalidArgument', 'The specified key is not valid', '/' . $path, Http::STATUS_BAD_REQUEST);
+		} catch (NotPermittedException | ForbiddenException) {
+			// The bucket folder is a read-only share, the quota is used up, an
+			// access control rule applies, or Nextcloud refused the name (such
+			// as `.htaccess`). The client's doing, not a server fault.
+			$response = $this->errorResponse('AccessDenied', 'Access Denied', '/' . $path, Http::STATUS_FORBIDDEN);
 		} catch (\Throwable $e) {
 			// Without this the framework renders an HTML error page, which no S3
 			// client can parse, and the failure looks like a protocol error
@@ -129,6 +170,9 @@ class S3Controller extends Controller {
 				}
 				$stripped->addHeader($name, $value);
 			}
+			if ($response->isThrottled()) {
+				$stripped->throttle($response->getThrottleMetadata());
+			}
 			return $stripped;
 		}
 
@@ -139,7 +183,11 @@ class S3Controller extends Controller {
 		try {
 			$auth = $this->authService->authenticate($this->request);
 		} catch (S3AuthException $e) {
-			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
+			$response = $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
+			if (in_array($e->getS3Code(), self::THROTTLED_CODES, true)) {
+				$response->throttle();
+			}
+			return $response;
 		}
 
 		// Set for this request only; the controller is instantiated per request.
@@ -168,20 +216,21 @@ class S3Controller extends Controller {
 			$objectKey = substr($path, $slashPos + 1);
 		}
 
+		if (strlen($objectKey) > self::MAX_KEY_BYTES) {
+			return $this->errorResponse('KeyTooLongError', 'Your key is too long', '/' . $bucketName, Http::STATUS_BAD_REQUEST);
+		}
+
 		if ($objectKey !== '' && !$this->isUsableKey($objectKey)) {
 			return $this->errorResponse('InvalidArgument', 'The specified key is not valid', '/' . $bucketName . '/' . $objectKey, Http::STATUS_BAD_REQUEST);
 		}
 
-		// Verify bucket access
+		// A key reaches exactly one bucket. Any other name gets the same answer
+		// whether or not the owner has a bucket by that name: telling the two
+		// apart would let a key enumerate its owner's other buckets, which
+		// ListBuckets deliberately does not reveal.
 		$bucket = $this->bucketService->getBucketByName($userId, $bucketName);
-		if ($bucket === null) {
+		if ($bucket === null || $auth['bucketId'] !== $bucket->getId()) {
 			return $this->errorResponse('NoSuchBucket', 'The specified bucket does not exist', '/' . $bucketName, Http::STATUS_NOT_FOUND);
-		}
-
-		// Verify this key is authorized for this bucket
-		if ($auth['bucketId'] !== $bucket->getId()) {
-			// Check if ListBuckets was requested (path is bucket name)
-			return $this->errorResponse('AccessDenied', 'Access Denied', '/' . $bucketName, Http::STATUS_FORBIDDEN);
 		}
 
 		$userFolder = $this->rootFolder->getUserFolder($userId);
@@ -388,7 +437,14 @@ class S3Controller extends Controller {
 	 * surface as an unhelpful 500 instead of a client error naming the problem.
 	 */
 	private function isUsableKey(string $objectKey): bool {
-		if (str_contains($objectKey, "\0")) {
+		if (str_contains($objectKey, "\0") || strlen($objectKey) > self::MAX_KEY_BYTES) {
+			return false;
+		}
+
+		// Nextcloud reads a backslash as a path separator, so `a\b` would be a
+		// second name for `a/b` — with a lock of its own, which voids the
+		// mutual exclusion conditional writes rely on.
+		if (str_contains($objectKey, '\\')) {
 			return false;
 		}
 
@@ -402,6 +458,11 @@ class S3Controller extends Controller {
 			// Empty segments come from "a//b"; "." and ".." would resolve
 			// outside the intended path.
 			if ($segment === '' || $segment === '.' || $segment === '..') {
+				return false;
+			}
+			// Each segment becomes a file or folder name, and filesystems stop
+			// at 255 bytes. Nextcloud reports that as a permission problem.
+			if (strlen($segment) > self::MAX_NAME_BYTES) {
 				return false;
 			}
 		}
@@ -1319,10 +1380,11 @@ class S3Controller extends Controller {
 			return $handle;
 		}
 
-		$out = fopen('php://temp/maxmemory:' . (8 * 1024 * 1024), 'w+b');
-		if ($out === false) {
+		try {
+			$out = $this->tempFiles->open();
+		} catch (S3AuthException $e) {
 			fclose($handle);
-			throw new S3AuthException('InternalError', 'Cannot buffer copy source', Http::STATUS_INTERNAL_SERVER_ERROR);
+			throw $e;
 		}
 
 		try {
@@ -1359,6 +1421,12 @@ class S3Controller extends Controller {
 		$doc = $this->parseXmlBody(file_get_contents('php://input') ?: '');
 		if ($doc === null) {
 			return $this->errorResponse('MalformedXML', 'The XML you provided was not well-formed', $resource, Http::STATUS_BAD_REQUEST);
+		}
+
+		// As on S3. Each key is a filesystem operation within one request, so
+		// without a bound a single body could keep PHP busy indefinitely.
+		if (count($doc->Object) > self::MAX_DELETE_KEYS) {
+			return $this->errorResponse('MalformedXML', 'A delete request may name at most ' . self::MAX_DELETE_KEYS . ' keys', $resource, Http::STATUS_BAD_REQUEST);
 		}
 
 		$quiet = strtolower(trim((string)$doc->Quiet)) === 'true';

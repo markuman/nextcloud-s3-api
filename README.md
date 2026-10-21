@@ -6,7 +6,7 @@
 
 *No object store · No duplication · Your files stay files*
 
-[![Nextcloud 32–36](https://img.shields.io/badge/Nextcloud-32--36-0082c9)](https://nextcloud.com)
+[![Nextcloud 33–36](https://img.shields.io/badge/Nextcloud-33--36-0082c9)](https://nextcloud.com)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![PHP 8.2+](https://img.shields.io/badge/PHP-8.2%2B-777bb4)](https://www.php.net)
 
@@ -94,7 +94,7 @@ API key. Note down both keys; the secret is shown once.
 
 <br>
 
-* Nextcloud 32–36, PHP 8.2+ — Nextcloud 35 and 36 need 8.3, but enforce that themselves, so the
+* Nextcloud 33–36, PHP 8.2+ — Nextcloud 35 and 36 need 8.3, but enforce that themselves, so the
   app's own floor only has to suit the older end of the range. 36 is declared ahead of its
   release and tested against the daily master build
 * **Nextcloud's cron must run** — abandoned multipart uploads are only reclaimed by a background
@@ -331,10 +331,18 @@ sync client) get an ETag on first read.
 
 **AWS Signature V4**, either via the `Authorization` header or as a presigned URL
 (`X-Amz-Signature` in the query string). Requests older than 15 minutes are rejected, as are
-expired presigned URLs; `X-Amz-Expires` is capped at seven days, as on AWS.
+expired presigned URLs; `X-Amz-Expires` is capped at seven days, as on AWS. `host` and every
+`x-amz-*` header the request carries must be signed.
 
 Each API key is bound to **exactly one bucket** and is either `readonly` or `readwrite`.
-`ListBuckets` reports only that bucket — not every bucket the owning account happens to have.
+`ListBuckets` reports only that bucket — not every bucket the owning account happens to have —
+and any other bucket name answers `NoSuchBucket`, whether the account has such a bucket or not.
+Keys stop working when their account is disabled and are removed when it is deleted. Wrong
+secrets and unknown keys count towards Nextcloud's brute force protection.
+
+> **Use HTTPS.** As on AWS, a signature only proves who made the request. Within its 15 minutes
+> (or a presigned URL's lifetime) anyone who captured it can replay it, and the request and
+> response bodies travel in the clear on plain HTTP.
 
 ---
 

@@ -76,6 +76,14 @@ def test_bulk_delete_malformed(s3, bucket):
     assert r.error_code == "MalformedXML"
 
 
+def test_bulk_delete_is_capped_at_1000_keys(s3, bucket, prefix):
+    s3.put(bucket, prefix + "k0", b"x")
+    r = bulk_delete(s3, bucket, [prefix + f"k{i}" for i in range(1001)])
+    assert r.status == 400
+    assert r.error_code == "MalformedXML"
+    assert s3.get(bucket, prefix + "k0").status == 200
+
+
 def test_bulk_delete_via_boto3(boto, s3, bucket, prefix):
     for k in ("x", "y"):
         s3.put(bucket, prefix + k, b"1")

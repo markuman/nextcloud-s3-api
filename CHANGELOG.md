@@ -17,6 +17,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
   is gone, and a body that declares a DTD at all is refused with `MalformedXML`: no S3 request
   carries one, and without a DTD there is nothing to expand, whatever the defaults. The check runs
   on the parsed document, so a UTF-16 body cannot hide its `<!DOCTYPE` from it.
+- **Keys of a disabled account kept working.** Nextcloud serves a disabled user's folder to
+  whoever asks for it, so the S3 endpoint stayed open after the login was closed. A key now
+  authenticates only while its account is enabled. When an account is deleted, its buckets, keys
+  and open uploads are deleted with it — before, a user created later under the same id would have
+  inherited them, working keys included.
+- **`host` and every `x-amz-*` header must be signed**, as on AWS. Unsigned, anyone able to alter a
+  request in flight could have added `x-amz-copy-source` to a captured PUT and turned it into a
+  copy of another object. Refused with `AccessDenied`.
+- An unknown bucket name and another bucket of the same account now get the same `404
+  NoSuchBucket`. A key could tell them apart before (`403` for the latter) and so list its owner's
+  other buckets, which `ListBuckets` deliberately does not show.
+- Wrong secrets and unknown access keys count towards Nextcloud's brute force protection (action
+  `s3_api_auth`), so an address that keeps guessing is slowed down. A stale clock does not count.
+- Objects of a type a browser renders as a document — HTML, SVG, XML, JavaScript — are served with
+  `Content-Disposition: attachment`, and every object with `X-Content-Type-Options: nosniff`. A
+  presigned URL opens on the Nextcloud origin, where an HTML object could otherwise pose as a login
+  page.
+- Request bodies, assembled multipart uploads and copied ranges are buffered in Nextcloud's
+  `tempdirectory` instead of `php://temp`, which spills to the system temp directory. The file is
+  unlinked as soon as it is open, so nothing is left behind even if PHP dies mid-request.
 
 ### Fixed
 - **A key with an empty segment addressed a different object.** Nextcloud collapses runs of slashes
@@ -26,6 +46,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
   like any other key that cannot be a path. Slashes between the endpoint and the bucket name are
   still tolerated, since a client configured with a trailing slash on the endpoint sends
   `…/s3//bucket/key`.
+- A backslash in a key is refused: Nextcloud reads it as a path separator, so `a\b` was a second
+  name for `a/b`, with a lock of its own.
+- Keys longer than 1024 bytes answer `KeyTooLongError`, a path segment over 255 bytes
+  `InvalidArgument`, and a name Nextcloud refuses (`.htaccess`) or a write it does not permit (a
+  read-only share, a full quota) `403 AccessDenied` — all of these used to be a `500`, or for long
+  keys whatever the database made of them.
+- `DeleteObjects` takes at most 1000 keys, as on S3.
+- An `aws-chunked` body must decode to the size given in `x-amz-decoded-content-length`. That also
+  catches an unsigned body cut off before its final chunk, which is accepted when the size fits.
+- A query parameter with a numeric name (`?123=x`) crashed signature verification with a `500`.
 - The source key of `CopyObject` and `UploadPartCopy` gets the same validation as a key in the
   request line. Before, only a `..` anywhere in it was refused: `a//b` and `a/./b` copied from
   `a/b`, a source inside `.s3-uploads/` read the parts of an upload in progress, and a valid key
@@ -63,6 +93,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
   against master's schema (unchanged since `stable35`), the code lints clean under PHP 8.5 with
   `E_ALL`, the full test suite passes, and the server logs no deprecation for the app while it
   runs.
+- **Nextcloud 32 is dropped; the range is now 33–36.** Database results are read with
+  `fetchAssociative()` and `fetchFirstColumn()`, which arrived in 33, instead of the PDO-style
+  `fetch()` and `fetchAll(PDO::FETCH_COLUMN)`. PHP 8.2 stays the floor, which is what 33 and 34
+  ask for.
 - The walgit example config no longer sets `max_retries`: walgit's S3 backend never reads it and
   retries through the AWS SDK's default of three attempts. The README now says what that means for
   the `503 SlowDown` that racing writes into a new folder can get.

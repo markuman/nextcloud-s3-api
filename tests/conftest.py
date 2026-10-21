@@ -296,8 +296,9 @@ def container():
     if not name:
         pytest.skip("no container to run commands in")
 
-    def run(*args):
-        return subprocess.run([engine, "exec", "-u", "www-data", name, *args],
+    def run(*args, env=None):
+        flags = [f"--env={k}={v}" for k, v in (env or {}).items()]
+        return subprocess.run([engine, "exec", "-u", "www-data", *flags, name, *args],
                               capture_output=True, text=True, check=True).stdout
 
     return run
@@ -305,7 +306,30 @@ def container():
 
 @pytest.fixture(scope="session")
 def occ(container):
-    return lambda *args: container("php", "occ", *args)
+    return lambda *args, env=None: container("php", "occ", *args, env=env)
+
+
+@pytest.fixture
+def make_user(occ, base_url):
+    """Create a throwaway Nextcloud user; returns a Nextcloud client for it.
+
+    Deleted again afterwards unless the test already did.
+    """
+    created = []
+
+    def make():
+        uid = f"s3t-{secrets.token_hex(4)}"
+        password = secrets.token_urlsafe(18)
+        occ("user:add", "--password-from-env", uid, env={"OC_PASS": password})
+        created.append(uid)
+        return Nextcloud(base_url, uid, password)
+
+    yield make
+    for uid in created:
+        try:
+            occ("user:delete", uid)
+        except subprocess.CalledProcessError:
+            pass
 
 
 @pytest.fixture(scope="session")

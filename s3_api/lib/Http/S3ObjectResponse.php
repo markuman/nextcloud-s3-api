@@ -49,7 +49,16 @@ class S3ObjectResponse extends Response implements ICallbackResponse {
 
 		$length = $isRange ? ($rangeEnd - $rangeStart + 1) : $size;
 
-		$this->addHeader('Content-Type', $file->getMimeType());
+		$mimeType = $file->getMimeType();
+		$this->addHeader('Content-Type', $mimeType);
+		$this->addHeader('X-Content-Type-Options', 'nosniff');
+		if (self::isActiveContent($mimeType)) {
+			// A presigned URL opens in a browser, on the Nextcloud origin. The
+			// CSP keeps scripts from running, but an HTML or SVG object could
+			// still render a convincing login form there. As a download it
+			// cannot; S3 clients ignore the header.
+			$this->addHeader('Content-Disposition', 'attachment');
+		}
 		$this->addHeader('Content-Length', (string)$length);
 		$this->addHeader('ETag', '"' . $etag . '"');
 		$this->addHeader('Last-Modified', gmdate('D, d M Y H:i:s \G\M\T', $file->getMTime()));
@@ -58,6 +67,25 @@ class S3ObjectResponse extends Response implements ICallbackResponse {
 		if ($isRange) {
 			$this->addHeader('Content-Range', 'bytes ' . $rangeStart . '-' . $rangeEnd . '/' . $size);
 		}
+	}
+
+	/**
+	 * Whether a browser would render the type as a document of its own, with
+	 * markup, forms or script, rather than display it passively.
+	 */
+	private static function isActiveContent(string $mimeType): bool {
+		$type = strtolower(trim(explode(';', $mimeType)[0]));
+
+		return in_array($type, [
+			'text/html',
+			'application/xhtml+xml',
+			'image/svg+xml',
+			'text/xml',
+			'application/xml',
+			'text/javascript',
+			'application/javascript',
+			'application/x-javascript',
+		], true);
 	}
 
 	public function callback(IOutput $output): void {

@@ -40,6 +40,7 @@ class MultipartService {
 	public function __construct(
 		private UploadMapper $uploadMapper,
 		private IEventDispatcher $eventDispatcher,
+		private TempFiles $tempFiles,
 	) {
 	}
 
@@ -251,10 +252,7 @@ class MultipartService {
 
 		// Assemble into a temp stream, then hand the finished bytes to the
 		// storage in one call so the object never exists half-written.
-		$assembled = fopen('php://temp/maxmemory:' . (8 * 1024 * 1024), 'w+b');
-		if ($assembled === false) {
-			throw new S3AuthException('InternalError', 'Cannot assemble parts', Http::STATUS_INTERNAL_SERVER_ERROR);
-		}
+		$assembled = $this->tempFiles->open();
 
 		$binaryEtags = '';
 		try {
