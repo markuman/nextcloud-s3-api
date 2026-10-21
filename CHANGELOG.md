@@ -3,7 +3,44 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased]
+## 1.6.0 – 2026-10-21
+
+### Security
+- **XML request bodies switched entity substitution on instead of off.** `DeleteObjects` and
+  `CompleteMultipartUpload` parsed their body with `LIBXML_NOENT`, which — despite the name, and
+  despite the comment next to it — makes libxml *substitute* entities, and load external ones
+  (`file://`, `php://filter`) to do so. `DeleteObjects` echoes every key back in its response, so
+  outside of Nextcloud that combination reads any file the web server can read, `config.php`
+  included, for anyone holding a readwrite key. Inside Nextcloud it was not exploitable: core
+  installs an external entity loader that returns nothing, and the app's safety rested entirely on
+  that default. Internal entities were expanded, though — a key could be spelled as `&k;`. The flag
+  is gone, and a body that declares a DTD at all is refused with `MalformedXML`: no S3 request
+  carries one, and without a DTD there is nothing to expand, whatever the defaults. The check runs
+  on the parsed document, so a UTF-16 body cannot hide its `<!DOCTYPE` from it.
+
+### Fixed
+- **A key with an empty segment addressed a different object.** Nextcloud collapses runs of slashes
+  in the request URI before routing, so a request for `a//b` — or `/b`, as in `bucket//b` — reached
+  the app as `a/b` and was served from there; a `DELETE` removed `a/b`. The key is now taken from
+  the raw request URI, where the empty segment is still visible, and refused with `InvalidArgument`
+  like any other key that cannot be a path. Slashes between the endpoint and the bucket name are
+  still tolerated, since a client configured with a trailing slash on the endpoint sends
+  `…/s3//bucket/key`.
+- The source key of `CopyObject` and `UploadPartCopy` gets the same validation as a key in the
+  request line. Before, only a `..` anywhere in it was refused: `a//b` and `a/./b` copied from
+  `a/b`, a source inside `.s3-uploads/` read the parts of an upload in progress, and a valid key
+  such as `a..b` could not be copied at all.
+- **Multipart uploads filled the trash bin.** Completing or aborting an upload deleted its scratch
+  folder with an ordinary delete, which Nextcloud's trash bin intercepts: every upload left a full
+  copy of its parts in the owner's trash, plus an empty `.s3-uploads` folder each time a bucket's
+  last upload finished — twice the space until the trash expired. A part uploaded twice also left
+  the first copy behind as a file version, which deleting the folder did not remove. Scratch data
+  is now deleted past the trash bin (the app answers the trash bin's `MoveToTrashEvent` for exactly
+  that folder), and a re-uploaded part replaces the old one instead of overwriting it, so no
+  version is created. Objects deleted through `DeleteObject` still go to the trash, as before.
+  What earlier releases left behind is not cleaned up: trash entries named after upload ids or
+  `.s3-uploads` expire with the trash, and stray versions remain under
+  `files_versions/<bucket folder>/.s3-uploads/`, where nothing reads them.
 
 ### Added
 - **An integration test suite** (`tests/`). `tests/run.sh` starts a throwaway Nextcloud in a
@@ -12,7 +49,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
   `UploadPartCopy`, `aws-chunked` bodies with tampered chunk signatures, read-only keys, and the
   settings API. It also drives [gits3](https://github.com/markuman/gits3srv) — its own S3 client
   and a real push / clone / gc cycle through it — when `gits3.py` is found next to this repository.
-  Not part of the release tarball.
+  The cleanup job and the object locks are covered by ageing rows in the test instance's database:
+  abandoned uploads, stale and held locks, orphaned ETags. Not part of the release tarball.
 - `NC_VERSION=master tests/run.sh` runs the suite against Nextcloud's daily master build — the
   next major before it has an image — by swapping the daily tarball into the newest stable image.
 
@@ -25,11 +63,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
   against master's schema (unchanged since `stable35`), the code lints clean under PHP 8.5 with
   `E_ALL`, the full test suite passes, and the server logs no deprecation for the app while it
   runs.
-
-### Known issues
-- A key with an empty segment such as `a//b` is not rejected: Nextcloud's router collapses the
-  `//` before the request reaches the app, so it silently addresses `a/b`. Covered by an expected
-  failure in the suite.
+- The walgit example config no longer sets `max_retries`: walgit's S3 backend never reads it and
+  retries through the AWS SDK's default of three attempts. The README now says what that means for
+  the `503 SlowDown` that racing writes into a new folder can get.
 
 ## 1.5.4 – 2026-10-20
 
@@ -60,9 +96,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com).
   better, and they leave the app treating one directory as two buckets — separate multipart scratch
   areas inside it, two ETag rows racing over one file id. Existing overlapping buckets are left
   alone: they still work, and now share a lock correctly. The comparison normalizes the path first,
-  because `/Documents//sub`, `/Documents/./sub` and `/Documents/other/../sub` all pass the
-  folder-exists check — Nextcloud collapses those itself — and would otherwise have slipped past
-  the overlap check while naming a folder that is already served.
+  because `/Documents//sub` and `/Documents/./sub` both pass the folder-exists check — Nextcloud
+  collapses those itself — and would otherwise have slipped past the overlap check while naming a
+  folder that is already served. (`/Documents/other/../sub` does not get that far: Nextcloud
+  refuses a path containing `..`, so the folder check already answers `400`.)
 - Creating a bucket whose name is already taken answers `409` with a readable message. It used to
   hit the unique index and surface as a `500` carrying the raw driver error, for what is the most
   ordinary mistake in that form. The index is still what decides — two racing requests can both

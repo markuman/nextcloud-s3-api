@@ -52,6 +52,11 @@ def test_self_copy_keeps_content(s3, bucket, prefix):
     ("{other}/{prefix}src", 400, "InvalidArgument"),
     ("{bucket}", 400, "InvalidArgument"),
     ("{bucket}/{prefix}../escape", 400, "InvalidArgument"),
+    # Source keys get the same validation as keys in the request line: these
+    # would otherwise resolve to {prefix}src or into the scratch area.
+    ("{bucket}/{prefix}/src", 400, "InvalidArgument"),
+    ("{bucket}/{prefix}./src", 400, "InvalidArgument"),
+    ("{bucket}/.s3-uploads/x", 400, "InvalidArgument"),
     ("{bucket}/{prefix}missing", 404, "NoSuchKey"),
     ("{bucket}/{prefix}folder", 404, "NoSuchKey"),
 ])
@@ -62,6 +67,15 @@ def test_copy_errors(s3, env, bucket, prefix, source, status, code):
     assert r.status == status
     assert r.error_code == code
     assert s3.get(bucket, prefix + "dst").status == 404
+
+
+def test_copy_source_with_dots_in_a_name(s3, bucket, prefix):
+    """`..` is only refused as a whole segment; up to 1.5.4 any source key
+    containing it was, although `a..b` is a valid key."""
+    s3.put(bucket, prefix + "a..b", b"dots")
+    r = copy(s3, bucket, prefix + "dst", f"{bucket}/{prefix}a..b")
+    assert r.status == 200, r.body
+    assert s3.get(bucket, prefix + "dst").body == b"dots"
 
 
 def test_copy_via_boto3(boto, s3, bucket, prefix):

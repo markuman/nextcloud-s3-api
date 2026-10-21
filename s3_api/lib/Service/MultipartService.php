@@ -4,12 +4,16 @@ declare(strict_types=1);
 
 namespace OCA\S3Api\Service;
 
+use OCA\Files_Trashbin\Events\MoveToTrashEvent;
 use OCA\S3Api\Db\Upload;
 use OCA\S3Api\Db\UploadMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\AppFramework\Http;
+use OCP\EventDispatcher\Event;
+use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Files\File;
 use OCP\Files\Folder;
+use OCP\Files\Node;
 use OCP\Files\NotFoundException;
 
 /**
@@ -17,7 +21,8 @@ use OCP\Files\NotFoundException;
  *
  * Parts are kept as files under a scratch folder in the bucket
  * (`.s3-uploads/<uploadId>/<partNumber>`) and concatenated on completion.
- * Listings hide that folder, so it never shows up as an object.
+ * Listings hide that folder, so it never shows up as an object, and it is
+ * deleted past the trash bin, so it does not linger there either.
  */
 class MultipartService {
 
@@ -34,6 +39,7 @@ class MultipartService {
 
 	public function __construct(
 		private UploadMapper $uploadMapper,
+		private IEventDispatcher $eventDispatcher,
 	) {
 	}
 
@@ -96,17 +102,22 @@ class MultipartService {
 		$folder = $this->partFolder($bucketFolder, $uploadId, true);
 		$name = $this->partName($partNumber);
 
+		// A part uploaded again replaces the earlier one. Writing over it in
+		// place would make Nextcloud keep the old bytes as a file version,
+		// which nothing reads and which outlives the upload: deleting the
+		// scratch folder does not take the versions of its files along. So
+		// the old part goes first and the new one is a fresh file.
 		try {
 			$existing = $folder->get($name);
-			if ($existing instanceof File) {
-				$existing->putContent($stream);
-				$file = $existing;
-			} else {
+			if (!($existing instanceof File)) {
 				throw new S3AuthException('InternalError', 'Part path is not a file', Http::STATUS_INTERNAL_SERVER_ERROR);
 			}
+			$this->deleteForGood($existing);
 		} catch (NotFoundException) {
-			$file = $folder->newFile($name, $stream);
+			// First upload of this part.
 		}
+
+		$file = $folder->newFile($name, $stream);
 
 		// The part ETag is the MD5 of its bytes, because CompleteMultipartUpload
 		// derives the final ETag from the part ETags.
@@ -299,11 +310,40 @@ class MultipartService {
 	public function discard(Folder $bucketFolder, Upload $upload): void {
 		$folder = $this->partFolder($bucketFolder, $upload->getUploadId(), false);
 		if ($folder !== null) {
-			$folder->delete();
+			$this->deleteForGood($folder);
 		}
 
 		$this->pruneScratchRoot($bucketFolder);
 		$this->uploadMapper->delete($upload);
+	}
+
+	/**
+	 * Delete scratch data without the detour through the trash bin.
+	 *
+	 * A plain delete() hands the node to the trash bin, so every completed or
+	 * aborted upload left a full copy of its parts in the owner's trash —
+	 * twice the space until the trash expired. The trash bin asks before it
+	 * takes a node, through MoveToTrashEvent; answering no for exactly this
+	 * node, and only while it is being deleted, leaves everything else the
+	 * user deletes as recoverable as before.
+	 *
+	 * With the trash bin app disabled the event never fires, and delete() is
+	 * final anyway.
+	 */
+	private function deleteForGood(Node $node): void {
+		$id = $node->getId();
+		$keepOutOfTrash = static function (Event $event) use ($id): void {
+			if ($event instanceof MoveToTrashEvent && $event->getNode()->getId() === $id) {
+				$event->disableTrashBin();
+			}
+		};
+
+		$this->eventDispatcher->addListener(MoveToTrashEvent::class, $keepOutOfTrash);
+		try {
+			$node->delete();
+		} finally {
+			$this->eventDispatcher->removeListener(MoveToTrashEvent::class, $keepOutOfTrash);
+		}
 	}
 
 	/**
@@ -325,7 +365,7 @@ class MultipartService {
 		}
 
 		if ($root instanceof Folder && $root->getDirectoryListing() === []) {
-			$root->delete();
+			$this->deleteForGood($root);
 		}
 	}
 

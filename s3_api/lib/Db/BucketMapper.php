@@ -98,8 +98,11 @@ class BucketMapper extends QBMapper {
 	 * means such a spelling passes the folder-exists check. If it were compared
 	 * here verbatim it would slip past the overlap check while still naming the
 	 * same directory, so the same collapsing has to happen before comparing.
-	 * `..` is resolved the way Nextcloud resolves it too; it cannot climb above
-	 * the user's home because these paths are all relative to it.
+	 *
+	 * `..` never gets here in practice: Nextcloud refuses a path containing
+	 * it, so the folder-exists check fails first. It is resolved anyway, so
+	 * the comparison does not depend on that; it cannot climb above the
+	 * user's home because these paths are all relative to it.
 	 */
 	private function normalizePath(string $path): string {
 		$segments = [];

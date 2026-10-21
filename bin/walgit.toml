@@ -2,7 +2,6 @@
 backend = "s3"
 bucket = "git"              # the bucket name registered in Nextcloud
 prefix = ""                     # optional key prefix inside the bucket
-max_retries = 8
 
 # Nextcloud is not a high-throughput object store and every part is buffered
 # server-side, so keep parts modest rather than the 64/32 MiB defaults.

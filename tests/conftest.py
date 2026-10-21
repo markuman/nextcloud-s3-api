@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -97,6 +98,16 @@ class Nextcloud:
 
     def remove(self, path):
         return self.http("DELETE", self.dav_path(path))
+
+    def trash(self):
+        """Original locations of everything in the trash bin, relative to the
+        user's files like the other paths here."""
+        body = (b'<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns">'
+                b"<d:prop><nc:trashbin-original-location/></d:prop></d:propfind>")
+        r = self.http("PROPFIND", f"/remote.php/dav/trashbin/{self.user}/trash", body, {"Depth": "1"})
+        assert r.status == 207, f"PROPFIND trash: {r.status}"
+        locations = ET.fromstring(r.body).iter("{http://nextcloud.org/ns}trashbin-original-location")
+        return [e.text.lstrip("/") for e in locations if e.text]
 
     # buckets and keys
     def create_bucket(self, folder, name):
@@ -275,14 +286,59 @@ def many_keys(s3, bucket):
 
 
 @pytest.fixture(scope="session")
-def occ():
-    container = os.environ.get("S3T_CONTAINER")
+def container():
+    """Run a command in the Nextcloud container as www-data, return stdout.
+
+    For what no HTTP API reaches: occ, the data directory, the database.
+    """
+    name = os.environ.get("S3T_CONTAINER")
     engine = os.environ.get("S3T_ENGINE", "podman")
-    if not container:
-        pytest.skip("no container to run occ in")
+    if not name:
+        pytest.skip("no container to run commands in")
 
     def run(*args):
-        return subprocess.run([engine, "exec", "-u", "www-data", container, "php", "occ", *args],
+        return subprocess.run([engine, "exec", "-u", "www-data", name, *args],
                               capture_output=True, text=True, check=True).stdout
+
+    return run
+
+
+@pytest.fixture(scope="session")
+def occ(container):
+    return lambda *args: container("php", "occ", *args)
+
+
+@pytest.fixture(scope="session")
+def datadir(occ):
+    return occ("config:system:get", "datadirectory").strip()
+
+
+# One prepared statement against SQLite, parameters as JSON. Rows come back
+# as a list of dicts, anything else as the number of rows it touched.
+_SQL = r"""
+$db = new PDO('sqlite:' . $argv[1]);
+$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$db->setAttribute(PDO::ATTR_TIMEOUT, 30);
+$stmt = $db->prepare($argv[2]);
+$stmt->execute(json_decode($argv[3], true));
+echo json_encode($stmt->columnCount() > 0 ? $stmt->fetchAll(PDO::FETCH_ASSOC) : $stmt->rowCount());
+"""
+
+
+@pytest.fixture(scope="session")
+def sql(container, occ, datadir):
+    """Run SQL against the instance's database.
+
+    For state the API cannot produce on demand: rows old enough for the
+    cleanup job, a lock left behind by a request that died. Tables carry the
+    default `oc_` prefix. tests/run.sh sets the instance up on SQLite; on
+    anything else this skips.
+    """
+    if occ("config:system:get", "dbtype").strip() != "sqlite3":
+        pytest.skip("needs the SQLite database tests/run.sh sets up")
+    path = f"{datadir}/{occ('config:system:get', 'dbname').strip()}.db"
+
+    def run(statement, *params):
+        return json.loads(container("php", "-r", _SQL, "--", path, statement, json.dumps(params)))
 
     return run

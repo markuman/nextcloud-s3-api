@@ -172,7 +172,6 @@ listings, server-side copy.
 backend = "s3"
 bucket = "gittest"              # the bucket name registered in Nextcloud
 prefix = ""                     # optional key prefix inside the bucket
-max_retries = 8
 
 # Nextcloud is not a high-throughput object store and every part is buffered
 # server-side, so keep parts modest rather than the 64/32 MiB defaults.
@@ -253,6 +252,15 @@ repos/<owner>/<repo>/wal/*.idx        # …plus .rev, .bitmap, .commit-graph
 `upload_max_filesize` and the web server's body limit (nginx `client_max_body_size`) — multipart
 sidesteps this, which is why the threshold above is lowered. And cron has to run, or abandoned
 uploads are never reclaimed.
+
+**`503 SlowDown` under parallel writes.** Writers that race into a folder that does not exist yet
+contend for Nextcloud's file locks while creating it; the losers get `503 SlowDown` before anything
+is written, so a retry is safe and normally succeeds because the folder exists by then. walgit
+relies on the AWS SDK's default retry for this — three attempts per request. Its own
+`store.max_retries` is not read by the S3 backend, so setting it changes nothing. Checked with a
+fault-injecting proxy: one or two `SlowDown` answers in a row per write are absorbed and the push
+and an empty-cache clone come out identical; a third fails the push cleanly with an HTTP 500, and
+nothing half-written is left as the repository's state.
 
 ---
 

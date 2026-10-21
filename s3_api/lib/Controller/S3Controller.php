@@ -158,6 +158,7 @@ class S3Controller extends Controller {
 			return $this->errorResponse('MethodNotAllowed', 'Method not allowed', '/', Http::STATUS_METHOD_NOT_ALLOWED);
 		}
 
+		$path = $this->requestedPath($path);
 		$slashPos = strpos($path, '/');
 		if ($slashPos === false) {
 			$bucketName = $path;
@@ -338,6 +339,44 @@ class S3Controller extends Controller {
 		}
 
 		return null;
+	}
+
+	/**
+	 * The `bucket/key` the client addressed, with every slash it sent.
+	 *
+	 * The routed `{path}` has lost some of them: Nextcloud collapses each run
+	 * of slashes in the request URI before routing — a guard against reverse
+	 * proxies that double them — so `a//b` arrives as `a/b`. In S3 those are
+	 * two different keys, and the client signed its request for the first;
+	 * serving the second silently aliases another object, a DELETE included.
+	 * Read from the raw request URI instead, the key keeps its empty segment
+	 * and isUsableKey() refuses it.
+	 *
+	 * Slashes between the endpoint and the bucket are skipped: a client whose
+	 * endpoint is configured with a trailing slash sends `…/s3//bucket/…`, and
+	 * that names no key. The raw path is only used when collapsing it gives
+	 * back exactly what was routed, so the two can differ in collapsed slashes
+	 * and nothing else. A request URI of any other shape keeps the routed
+	 * path.
+	 */
+	private function requestedPath(string $routed): string {
+		$uri = $this->request->getRequestUri();
+		$query = strpos($uri, '?');
+		if ($query !== false) {
+			$uri = substr($uri, 0, $query);
+		}
+
+		if (preg_match('#/apps/s3_api/s3/+(.+)$#', $uri, $match) !== 1) {
+			return $routed;
+		}
+
+		// Nextcloud collapses first and decodes second; compare the same way,
+		// or an encoded slash next to a literal one would not round-trip.
+		if (rawurldecode((string)preg_replace('#/{2,}#', '/', $match[1])) !== $routed) {
+			return $routed;
+		}
+
+		return rawurldecode($match[1]);
 	}
 
 	/**
@@ -1011,21 +1050,8 @@ class S3Controller extends Controller {
 	 *         XML cannot be parsed
 	 */
 	private function parseCompleteBody(string $xml): ?array {
-		if (trim($xml) === '') {
-			return null;
-		}
-
-		$previous = libxml_use_internal_errors(true);
-		try {
-			// LIBXML_NONET plus no entity substitution: the body is untrusted,
-			// and an XXE here would read server-side files.
-			$doc = simplexml_load_string($xml, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOENT);
-		} finally {
-			libxml_clear_errors();
-			libxml_use_internal_errors($previous);
-		}
-
-		if ($doc === false) {
+		$doc = $this->parseXmlBody($xml);
+		if ($doc === null) {
 			return null;
 		}
 
@@ -1042,6 +1068,51 @@ class S3Controller extends Controller {
 		}
 
 		return $parts === [] ? null : $parts;
+	}
+
+	/**
+	 * Parse an XML request body, or return null when it is malformed or
+	 * declares a DTD.
+	 *
+	 * The body is untrusted. Entity substitution stays off — `LIBXML_NOENT`,
+	 * despite its name, switches it *on*, and with it libxml loads external
+	 * entities (`file://`, `php://filter`). Inside Nextcloud that is only
+	 * stopped by the null entity loader core installs at startup; outside of
+	 * it, those flags read local files into whatever the document says.
+	 *
+	 * Turning substitution off is not enough on its own: SimpleXML still
+	 * expands *internal* entities when an element is cast to a string. So a
+	 * document that declares a DTD at all is refused. No S3 request carries
+	 * one, and without a DTD there is no entity to expand, internal or
+	 * external, whatever libxml's or Nextcloud's defaults are.
+	 *
+	 * The DTD is looked up on the parsed tree rather than by searching the raw
+	 * bytes for `<!DOCTYPE`, which a UTF-16 body would slip past. Parsing it
+	 * first is harmless: without `LIBXML_NOENT` or `LIBXML_DTDLOAD` libxml
+	 * fetches nothing, and nothing is expanded until a value is read.
+	 */
+	private function parseXmlBody(string $xml): ?\SimpleXMLElement {
+		if (trim($xml) === '') {
+			return null;
+		}
+
+		$previous = libxml_use_internal_errors(true);
+		try {
+			$doc = simplexml_load_string($xml, \SimpleXMLElement::class, LIBXML_NONET);
+		} finally {
+			libxml_clear_errors();
+			libxml_use_internal_errors($previous);
+		}
+
+		if ($doc === false) {
+			return null;
+		}
+
+		if (dom_import_simplexml($doc)->ownerDocument?->doctype !== null) {
+			return null;
+		}
+
+		return $doc;
 	}
 
 	// ---- copy -------------------------------------------------------------
@@ -1167,6 +1238,10 @@ class S3Controller extends Controller {
 	 * The value is `/bucket/key` or `bucket/key`, percent-encoded, and may
 	 * carry a `?versionId=` suffix. Only copies inside the authorised bucket
 	 * are allowed, since credentials are scoped to one bucket.
+	 *
+	 * The source key gets the same validation as a key in the request line:
+	 * it is resolved to a path just the same, where `a//b` and `a/./b` would
+	 * read `a/b`, and `.s3-uploads/…` the parts of an upload in progress.
 	 */
 	private function parseCopySource(string $copySource, string $bucketName): ?string {
 		$value = ltrim($copySource, '/');
@@ -1187,11 +1262,8 @@ class S3Controller extends Controller {
 		}
 
 		$key = rawurldecode(substr($value, $slash + 1));
-		if ($key === '' || str_contains($key, '..')) {
-			return null;
-		}
 
-		return $key;
+		return $this->isUsableKey($key) ? $key : null;
 	}
 
 	/**
@@ -1284,16 +1356,8 @@ class S3Controller extends Controller {
 			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
 		}
 
-		$body = file_get_contents('php://input') ?: '';
-		$previous = libxml_use_internal_errors(true);
-		try {
-			$doc = simplexml_load_string($body, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOENT);
-		} finally {
-			libxml_clear_errors();
-			libxml_use_internal_errors($previous);
-		}
-
-		if ($doc === false) {
+		$doc = $this->parseXmlBody(file_get_contents('php://input') ?: '');
+		if ($doc === null) {
 			return $this->errorResponse('MalformedXML', 'The XML you provided was not well-formed', $resource, Http::STATUS_BAD_REQUEST);
 		}
 

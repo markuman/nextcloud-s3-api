@@ -92,6 +92,32 @@ def test_abort(boto, s3, bucket, upload):
     assert s3.get(bucket, key).status == 404
 
 
+@pytest.mark.parametrize("finish", ["complete", "abort"])
+def test_finished_upload_leaves_nothing_behind(boto, s3, nc, env, container, datadir, bucket, prefix, finish):
+    """Regression: up to 1.5.4 a finished upload moved its parts -- and the
+    emptied scratch folder -- into the owner's trash bin, and a part uploaded
+    twice left a file version behind that nothing ever removed."""
+    scratch = f"{env.main.folder}/.s3-uploads"
+
+    def scratch_in_trash():
+        return sorted(loc for loc in nc.trash() if loc == scratch or loc.startswith(scratch + "/"))
+
+    before = scratch_in_trash()
+    key = prefix + "big.bin"
+    upload_id = boto.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
+    put_part(boto, bucket, key, upload_id, 1, b"first try")
+    etag = put_part(boto, bucket, key, upload_id, 1, b"second try")
+    if finish == "complete":
+        complete(boto, bucket, key, upload_id, [(1, etag)])
+        assert s3.get(bucket, key).body == b"second try"
+    else:
+        boto.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+
+    assert scratch_in_trash() == before
+    versions = f"{datadir}/{nc.user}/files_versions/{scratch}/{upload_id}"
+    assert container("sh", "-c", f"ls -A '{versions}' 2>/dev/null || true") == ""
+
+
 def test_part_below_minimum_size(boto, bucket, upload):
     key, upload_id = upload
     e1 = put_part(boto, bucket, key, upload_id, 1, b"small")

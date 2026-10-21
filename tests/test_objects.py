@@ -69,8 +69,8 @@ def test_same_size_different_content_in_same_second(s3, bucket, prefix):
 def test_identical_rewrite_keeps_etag(s3, bucket, prefix):
     """Content-derived ETags, as on AWS: same bytes, same ETag.
 
-    Worth knowing for gits3's gc, which rewrites packed-refs unchanged
-    expecting a new ETag to fence off concurrent pushers.
+    Which is why gits3's gc cannot fence off concurrent pushers by rewriting
+    packed-refs unchanged; it changes the header line instead.
     """
     key = prefix + "packed-refs"
     first = s3.put(bucket, key, b"same").etag
@@ -110,9 +110,7 @@ def test_nested_key_is_a_nextcloud_file(s3, nc, env, bucket, prefix):
 
 @pytest.mark.parametrize("suffix", [
     "dir/",
-    pytest.param("a//b", marks=pytest.mark.xfail(strict=True, reason=(
-        "known bug: Nextcloud's router collapses '//' in {path} before the controller sees it, "
-        "so isUsableKey never gets the empty segment and 'a//b' silently aliases 'a/b'"))),
+    "a//b",
     "a/./b",
     "a/../b",
     ".s3-uploads/x",
@@ -122,6 +120,38 @@ def test_unusable_keys_are_rejected(s3, bucket, prefix, suffix):
     r = s3.put(bucket, key, b"x")
     assert r.status == 400
     assert r.error_code == "InvalidArgument"
+
+
+def test_key_with_leading_slash_is_rejected(s3, bucket, prefix):
+    """`bucket//x` addresses the key `/x`, which has an empty first segment."""
+    s3.put(bucket, prefix + "x", b"keep")
+    r = s3.put(bucket, "/" + prefix + "x", b"overwrite")
+    assert r.status == 400
+    assert r.error_code == "InvalidArgument"
+    assert s3.get(bucket, prefix + "x").body == b"keep"
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "PUT", "DELETE"])
+def test_empty_segment_does_not_alias(s3, bucket, prefix, method):
+    """Regression: Nextcloud collapses `//` before routing, so up to 1.5.4 a
+    request for `a//b` was served from `a/b` -- a DELETE removed it."""
+    s3.put(bucket, prefix + "a/b", b"keep")
+    r = s3.request(method, bucket, prefix + "a//b", b"overwrite" if method == "PUT" else b"")
+    assert r.status == 400
+    if method != "HEAD":
+        assert r.error_code == "InvalidArgument"
+    assert s3.get(bucket, prefix + "a/b").body == b"keep"
+
+
+def test_doubled_slash_before_the_bucket_is_tolerated(env, bucket, prefix):
+    """An endpoint configured with a trailing slash makes some clients send
+    `…/s3//bucket/key`. That names no key, so it keeps working."""
+    client = env.client(env.rw)
+    client.base += "/"
+    assert client.uri(bucket, prefix + "x").count("//") == 1
+    assert client.put(bucket, prefix + "x", b"via //").status == 200
+    assert client.get(bucket, prefix + "x").body == b"via //"
+    assert client.list_all(bucket, prefix) == [prefix + "x"]
 
 
 def test_put_below_a_file_conflicts(s3, bucket, prefix):
