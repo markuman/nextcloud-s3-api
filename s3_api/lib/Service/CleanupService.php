@@ -28,8 +28,9 @@ class CleanupService {
 	private const UPLOAD_MAX_AGE_SECONDS = 7 * 24 * 3600;
 
 	/**
-	 * Locks older than this cannot be held by a live request: PHP's own
-	 * execution limit is far below it.
+	 * Locks older than this are swept. Well above the point where
+	 * ObjectLockService breaks a lock as stale, so this only removes rows of
+	 * keys nobody has written since.
 	 */
 	private const LOCK_MAX_AGE_SECONDS = 3600;
 

@@ -9,6 +9,7 @@ use OCA\S3Api\Http\S3ObjectResponse;
 use OCA\S3Api\Service\BucketService;
 use OCA\S3Api\Service\ChunkSignatureVerifier;
 use OCA\S3Api\Service\EtagService;
+use OCA\S3Api\Service\KeyRules;
 use OCA\S3Api\Service\MultipartService;
 use OCA\S3Api\Service\ObjectLockService;
 use OCA\S3Api\Service\S3AuthException;
@@ -36,12 +37,6 @@ use OCP\Lock\LockedException;
 use Psr\Log\LoggerInterface;
 
 class S3Controller extends Controller {
-
-	/** S3's limit on a key, in UTF-8 bytes. */
-	private const MAX_KEY_BYTES = 1024;
-
-	/** The longest file or folder name a filesystem takes, in bytes. */
-	private const MAX_NAME_BYTES = 255;
 
 	/** S3's limit on the keys in one DeleteObjects request. */
 	private const MAX_DELETE_KEYS = 1000;
@@ -216,7 +211,7 @@ class S3Controller extends Controller {
 			$objectKey = substr($path, $slashPos + 1);
 		}
 
-		if (strlen($objectKey) > self::MAX_KEY_BYTES) {
+		if (strlen($objectKey) > KeyRules::MAX_KEY_BYTES) {
 			return $this->errorResponse('KeyTooLongError', 'Your key is too long', '/' . $bucketName, Http::STATUS_BAD_REQUEST);
 		}
 
@@ -435,45 +430,13 @@ class S3Controller extends Controller {
 	 * ones that cannot be are rejected up front. Nextcloud refuses these anyway
 	 * -- nothing escapes the bucket -- but it does so by raising, which would
 	 * surface as an unhelpful 500 instead of a client error naming the problem.
+	 *
+	 * The segment rules live in KeyRules, shared with the listing prefix. A
+	 * trailing slash -- a "directory marker", which has no file to store it in
+	 * -- fails them as an empty last segment.
 	 */
 	private function isUsableKey(string $objectKey): bool {
-		if (str_contains($objectKey, "\0") || strlen($objectKey) > self::MAX_KEY_BYTES) {
-			return false;
-		}
-
-		// Nextcloud reads a backslash as a path separator, so `a\b` would be a
-		// second name for `a/b` — with a lock of its own, which voids the
-		// mutual exclusion conditional writes rely on.
-		if (str_contains($objectKey, '\\')) {
-			return false;
-		}
-
-		// A trailing slash denotes a "directory marker", which has no file to
-		// store it in.
-		if (str_ends_with($objectKey, '/')) {
-			return false;
-		}
-
-		foreach (explode('/', $objectKey) as $segment) {
-			// Empty segments come from "a//b"; "." and ".." would resolve
-			// outside the intended path.
-			if ($segment === '' || $segment === '.' || $segment === '..') {
-				return false;
-			}
-			// Each segment becomes a file or folder name, and filesystems stop
-			// at 255 bytes. Nextcloud reports that as a permission problem.
-			if (strlen($segment) > self::MAX_NAME_BYTES) {
-				return false;
-			}
-		}
-
-		// The multipart scratch area is internal.
-		if (str_starts_with($objectKey, MultipartService::SCRATCH_DIR . '/')
-			|| $objectKey === MultipartService::SCRATCH_DIR) {
-			return false;
-		}
-
-		return true;
+		return KeyRules::isPlainPath($objectKey) && !KeyRules::isInScratchArea($objectKey);
 	}
 
 	/**

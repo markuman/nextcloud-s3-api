@@ -164,3 +164,30 @@ def test_boto3_paginator(boto, bucket, many_keys):
     p, keys = many_keys
     pages = boto.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=p)
     assert [o["Key"] for page in pages for o in page.get("Contents", [])] == keys
+
+
+def test_prefix_cannot_leave_or_alias_the_bucket(s3, s3_ro, boto, env, bucket, prefix):
+    """The folder part of a prefix is resolved as a path. A segment no key can
+    have (`..`, `.`, empty, a backslash) must not reach another folder -- not
+    the owner's home, not the bucket root under a second name, not the
+    multipart scratch area -- and the scratch area is not listable by name."""
+    put_many(s3, bucket, [prefix + "a/x", prefix + "b"])
+    upload = boto.create_multipart_upload(Bucket=bucket, Key=prefix + "big")
+    boto.upload_part(Bucket=bucket, Key=prefix + "big", UploadId=upload["UploadId"], PartNumber=1, Body=b"x")
+    try:
+        for p in ("../", "../" + env.other.folder + "/", prefix + "a/../", prefix + "a/../../",
+                  "./", "./.s3-uploads/", prefix + "./", prefix + "a//", "/" + prefix, prefix + "a\\",
+                  ".s3-uploads/", ".s3-uploads/" + upload["UploadId"] + "/"):
+            for client in (s3, s3_ro):
+                r = client.list_v2(bucket, prefix=p)
+                assert r.status == 200, (p, r.status, r.body)
+                root = r.xml()
+                assert keys_of(root) == [], p
+                assert prefixes_of(root) == [], p
+                r = client.list_v2(bucket, prefix=p, delimiter="/")
+                assert r.status == 200, (p, r.status, r.body)
+                assert keys_of(r.xml()) == [] and prefixes_of(r.xml()) == [], p
+        # The plain spelling still works.
+        assert s3.list_all(bucket, prefix + "a/") == [prefix + "a/x"]
+    finally:
+        boto.abort_multipart_upload(Bucket=bucket, Key=prefix + "big", UploadId=upload["UploadId"])

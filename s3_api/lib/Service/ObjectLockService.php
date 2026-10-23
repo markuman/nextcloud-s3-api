@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace OCA\S3Api\Service;
 
 use OCP\DB\Exception as DbException;
+use OCP\DB\QueryBuilder\IQueryBuilder;
 use OCP\Files\Folder;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
@@ -29,9 +30,22 @@ class ObjectLockService {
 	 * How long a lock may be held before another request may break it.
 	 *
 	 * Only relevant when a process dies between acquire and release: the row
-	 * would otherwise block the key forever.
+	 * would otherwise block the key forever. Breaking a lock whose holder is
+	 * still alive is the worse failure -- two writers, and the conditional
+	 * write it protects silently loses an update -- so this is generous: the
+	 * write under the lock stores the whole body, which on slow storage (object
+	 * storage as primary, a remote mount) runs well past two minutes for a big
+	 * object. PHP gives no reliable bound either: max_execution_time counts CPU
+	 * time on Linux, not time spent waiting on storage, and php-fpm's
+	 * wall-clock request_terminate_timeout is off unless the admin sets it.
+	 * CleanupService sweeps what is left after an hour.
+	 *
+	 * The price: after a crash the key refuses conditional writes (503
+	 * SlowDown) for up to this long. Database advisory locks (GET_LOCK,
+	 * pg_advisory_lock) die with the connection and would avoid both problems,
+	 * but differ per database and SQLite has none.
 	 */
-	private const STALE_AFTER_SECONDS = 120;
+	private const STALE_AFTER_SECONDS = 900;
 
 	/** Total time to wait for a contended lock. */
 	private const WAIT_TIMEOUT_SECONDS = 10;
@@ -68,11 +82,11 @@ class ObjectLockService {
 	public function withLock(Folder $bucketFolder, string $objectKey, \Closure $operation) {
 		$lockKey = hash('sha256', $this->pathFor($bucketFolder, $objectKey));
 
-		$this->acquire($lockKey, $objectKey);
+		$lockId = $this->acquire($lockKey, $objectKey);
 		try {
 			return $operation();
 		} finally {
-			$this->release($lockKey);
+			$this->release($lockId);
 		}
 	}
 
@@ -91,24 +105,29 @@ class ObjectLockService {
 	}
 
 	/**
+	 * @return int the id of the row that is the lock, for release()
 	 * @throws S3AuthException
 	 */
-	private function acquire(string $lockKey, string $objectKey): void {
+	private function acquire(string $lockKey, string $objectKey): int {
 		$deadline = microtime(true) + self::WAIT_TIMEOUT_SECONDS;
 
 		while (true) {
-			if ($this->tryInsert($lockKey)) {
-				return;
+			$id = $this->tryInsert($lockKey);
+			if ($id !== null) {
+				return $id;
 			}
 
 			// Someone holds it. Drop it if it is old enough to be a leftover
 			// from a process that died mid-write.
-			if ($this->breakIfStale($lockKey) && $this->tryInsert($lockKey)) {
-				$this->logger->warning('Broke a stale S3 object lock', [
-					'app' => 's3_api',
-					'key' => $objectKey,
-				]);
-				return;
+			if ($this->breakIfStale($lockKey)) {
+				$id = $this->tryInsert($lockKey);
+				if ($id !== null) {
+					$this->logger->warning('Broke a stale S3 object lock', [
+						'app' => 's3_api',
+						'key' => $objectKey,
+					]);
+					return $id;
+				}
 			}
 
 			if (microtime(true) >= $deadline) {
@@ -123,24 +142,28 @@ class ObjectLockService {
 		}
 	}
 
-	private function tryInsert(string $lockKey): bool {
+	/**
+	 * @return ?int the new row's id, or null when another request holds the lock
+	 */
+	private function tryInsert(string $lockKey): ?int {
 		$qb = $this->db->getQueryBuilder();
 		$qb->insert('s3api_locks')
 			->values([
 				'lock_key' => $qb->createNamedParameter($lockKey),
-				'acquired_at' => $qb->createNamedParameter(time(), \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_INT),
+				'acquired_at' => $qb->createNamedParameter(time(), IQueryBuilder::PARAM_INT),
 			]);
 
 		try {
 			$qb->executeStatement();
-			return true;
 		} catch (DbException $e) {
 			// The unique index rejected it: another request holds the lock.
 			if ($e->getReason() === DbException::REASON_UNIQUE_CONSTRAINT_VIOLATION) {
-				return false;
+				return null;
 			}
 			throw $e;
 		}
+
+		return $qb->getLastInsertId();
 	}
 
 	/**
@@ -152,16 +175,22 @@ class ObjectLockService {
 			->where($qb->expr()->eq('lock_key', $qb->createNamedParameter($lockKey)))
 			->andWhere($qb->expr()->lt(
 				'acquired_at',
-				$qb->createNamedParameter(time() - self::STALE_AFTER_SECONDS, \OCP\DB\QueryBuilder\IQueryBuilder::PARAM_INT),
+				$qb->createNamedParameter(time() - self::STALE_AFTER_SECONDS, IQueryBuilder::PARAM_INT),
 			));
 
 		return $qb->executeStatement() > 0;
 	}
 
-	private function release(string $lockKey): void {
+	/**
+	 * Delete this request's own row, by id rather than by key: if the lock was
+	 * broken as stale meanwhile, the row under this key belongs to whoever
+	 * took it next, and removing that would let a third request in while the
+	 * second is still writing.
+	 */
+	private function release(int $lockId): void {
 		$qb = $this->db->getQueryBuilder();
 		$qb->delete('s3api_locks')
-			->where($qb->expr()->eq('lock_key', $qb->createNamedParameter($lockKey)));
+			->where($qb->expr()->eq('id', $qb->createNamedParameter($lockId, IQueryBuilder::PARAM_INT)));
 
 		try {
 			$qb->executeStatement();

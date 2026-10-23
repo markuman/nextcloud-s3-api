@@ -3,6 +3,29 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
+## 1.6.1 – 2026-10-23
+
+### Fixed
+- **A listing prefix was resolved as a path without being checked like a key.** Its folder part
+  went straight to Nextcloud, which refuses `..` (that surfaced as `403`) but folds `./`, `//` and
+  `\` into another folder: `./.s3-uploads/` listed the multipart scratch area, which is only hidden
+  at the bucket root, and `a/./` listed `a/` under keys that do not exist. Such a prefix — and
+  `.s3-uploads/` itself — now matches nothing, as no key can contain those segments.
+- **A lock held for more than two minutes could be broken by a waiting write.** The write under the
+  lock stores the whole body, which on slow storage takes longer than that for a big object; the
+  next conditional write broke the lock and both went ahead, losing an update. A lock is now
+  stale after fifteen minutes. Releasing deletes the request's own row rather than whatever row the
+  key has, so a request whose lock was broken no longer lets a third one in on finishing.
+  **Operator-visible:** if a PHP process dies while holding a lock, conditional writes to that one
+  key now answer `503 SlowDown` for up to fifteen minutes instead of two. Unconditional writes and
+  reads are not affected. To clear it sooner, delete the key's row from `oc_s3api_locks`.
+- Folder names in a listing prefix that Nextcloud refuses to look up (an admin-forbidden name, a
+  character the storage cannot hold) give an empty listing instead of a `500`.
+
+### Changed
+- The key rules (segments, length, backslash, NUL, scratch area) live in one place, `KeyRules`,
+  used both for keys and for listing prefixes.
+
 ## 1.6.0 – 2026-10-21
 
 ### Security

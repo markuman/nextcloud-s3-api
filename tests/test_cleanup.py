@@ -77,10 +77,10 @@ def test_cleanup_job(boto, s3, nc, env, sql, run_cleanup, bucket, prefix):
 
 def test_stale_lock_is_broken(s3, nc, env, sql, bucket, prefix):
     """A lock whose request died does not wedge the key: once it is older than
-    two minutes, the next conditional write breaks it."""
+    fifteen minutes, the next conditional write breaks it."""
     key = prefix + "obj"
     lk = lock_key(nc, env, key)
-    sql("INSERT INTO oc_s3api_locks (lock_key, acquired_at) VALUES (?, ?)", lk, int(time.time()) - 300)
+    sql("INSERT INTO oc_s3api_locks (lock_key, acquired_at) VALUES (?, ?)", lk, int(time.time()) - 1000)
 
     started = time.monotonic()
     r = s3.put(bucket, key, b"x", headers={"If-None-Match": "*"})
@@ -92,9 +92,11 @@ def test_stale_lock_is_broken(s3, nc, env, sql, bucket, prefix):
 
 
 def test_held_lock_holds_off_conditional_writes(s3, nc, env, sql, bucket, prefix):
+    """Five minutes old is not stale: a big write to slow storage can hold the
+    lock that long, and breaking it would let a second writer in."""
     key = prefix + "obj"
     lk = lock_key(nc, env, key)
-    sql("INSERT INTO oc_s3api_locks (lock_key, acquired_at) VALUES (?, ?)", lk, int(time.time()))
+    sql("INSERT INTO oc_s3api_locks (lock_key, acquired_at) VALUES (?, ?)", lk, int(time.time()) - 300)
     try:
         started = time.monotonic()
         r = s3.put(bucket, key, b"x", headers={"If-None-Match": "*"})
@@ -111,3 +113,4 @@ def test_held_lock_holds_off_conditional_writes(s3, nc, env, sql, bucket, prefix
 
     etag = s3.head(bucket, key).etag
     assert s3.put(bucket, key, b"z", headers={"If-Match": etag}).status == 200
+

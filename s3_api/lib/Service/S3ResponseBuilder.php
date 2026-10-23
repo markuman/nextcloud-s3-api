@@ -7,7 +7,10 @@ namespace OCA\S3Api\Service;
 use OCA\S3Api\Db\Upload;
 use OCP\Files\File;
 use OCP\Files\Folder;
+use OCP\Files\ForbiddenException;
+use OCP\Files\InvalidPathException;
 use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
 
 class S3ResponseBuilder {
 
@@ -284,7 +287,20 @@ class S3ResponseBuilder {
 		$literal = $lastSlash === false ? '' : substr($prefix, 0, $lastSlash + 1);
 		$start = $bucketFolder;
 		if ($literal !== '') {
-			$resolved = $this->resolveFolder($bucketFolder, rtrim($literal, '/'));
+			// The literal part is resolved as a path, so it has to be one that
+			// names exactly the keys it spells. Nextcloud refuses `..` itself,
+			// but folds `./`, `//` and `\` into some other folder, whose
+			// contents would then be listed under keys that do not exist -- and
+			// under `./` the scratch area, which walk() only hides at the top
+			// level. No stored key has such a segment, so nothing can match.
+			// Jumping into the scratch area by name is refused the same way.
+			// $literal always ends in the slash strrpos() found; without it,
+			// a plain path has no empty segment left.
+			$folderPath = substr($literal, 0, -1);
+			if (!KeyRules::isPlainPath($folderPath) || KeyRules::isInScratchArea($folderPath)) {
+				return ['objects' => [], 'commonPrefixes' => [], 'truncated' => false, 'next' => null];
+			}
+			$resolved = $this->resolveFolder($bucketFolder, $folderPath);
 			if ($resolved === null) {
 				return ['objects' => [], 'commonPrefixes' => [], 'truncated' => false, 'next' => null];
 			}
@@ -441,9 +457,12 @@ class S3ResponseBuilder {
 			return $bucketFolder;
 		}
 
+		// A name Nextcloud will not look up -- forbidden by the admin, reserved
+		// like `.htaccess`, a character the storage cannot hold -- holds no
+		// keys either. For a prefix that is an empty listing, not a failure.
 		try {
 			$node = $bucketFolder->get($relativePath);
-		} catch (NotFoundException) {
+		} catch (NotFoundException | InvalidPathException | NotPermittedException | ForbiddenException) {
 			return null;
 		}
 

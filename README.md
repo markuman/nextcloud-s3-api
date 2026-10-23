@@ -273,7 +273,10 @@ sync client) get an ETag on first read.
 
 * **Conditional writes** return `412 PreconditionFailed`. `If-None-Match: *` is create-only,
   `If-Match: <etag>` replaces exactly that version. Concurrent conditional writes to one key are
-  serialised, so exactly one of a set of racing creates or updates succeeds.
+  serialised, so exactly one of a set of racing creates or updates succeeds. The lock behind
+  that is a database row; should a PHP process die while holding it, conditional writes to that
+  one key answer `503 SlowDown` until it counts as stale after fifteen minutes (other keys, reads
+  and unconditional writes are unaffected).
 * **Streaming.** Uploads are not held in memory. `Content-Encoding: aws-chunked` with a trailing
   checksum — the default for current AWS SDKs — is decoded rather than stored verbatim. Where the
   client signs each chunk (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) the signature chain is verified,
