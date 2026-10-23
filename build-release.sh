@@ -8,7 +8,7 @@
 # name and is rejected — hence this script.
 #
 # The app already lives in s3_api/, so this only has to prune the repository
-# scaffolding (README, walgit test rig, LICENSE) from around it while keeping
+# scaffolding (README, LICENSE) from around it while keeping
 # CHANGELOG.md, which the store parses out of the archive.
 #
 # Usage:

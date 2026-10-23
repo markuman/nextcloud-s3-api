@@ -153,65 +153,34 @@ s3.upload_file("file.txt", "my-bucket", "file.txt")
 
 ---
 
-## 📦 Using it as a walgit store
+## 🐚 Using it as a gits3 backend
 
-[walgit](https://github.com/tobi/walgit) keeps git history in an object store and uses conditional
-writes on `manifest.pb` as its commit point. That exercises considerably more of the S3 API than a
-file sync does: compare-and-swap, conditional and ranged reads, presigned URLs, delimited
-listings, server-side copy.
+[gits3](https://github.com/markuman/gits3srv) is a git server in a single file: clone and push
+over HTTP, bare repositories in the bucket, no database. Ref updates are conditional writes on
+`packed-refs` (`If-Match`), packs go up as plain PUTs. That exercises considerably more of the S3
+API than a file sync does: compare-and-swap, content ETags, ranged reads, delimited listings.
 
-**walgit's backend contract suite passes against this app.**
+**gits3's own S3 client and a real push / clone / gc cycle run against this app in the test
+suite** (`tests/test_gits3.py`, `tests/test_gits3_e2e.py`).
 
 <details>
-<summary><b>walgit.toml</b></summary>
+<summary><b>Environment</b></summary>
 
 <br>
 
-```toml
-[store]
-backend = "s3"
-bucket = "gittest"              # the bucket name registered in Nextcloud
-prefix = ""                     # optional key prefix inside the bucket
-
-# Nextcloud is not a high-throughput object store and every part is buffered
-# server-side, so keep parts modest rather than the 64/32 MiB defaults.
-multipart_threshold = "32MiB"
-multipart_part_size = "8MiB"
-
-[store.s3]
-# Note the trailing slash: aws-sdk-rust does not add a separator before the
-# bucket name.
-endpoint = "https://<nextcloud-host>/apps/s3_api/s3/"
-region = "us-east-1"
-access_key_env = "AWS_ACCESS_KEY_ID"
-secret_key_env = "AWS_SECRET_ACCESS_KEY"
-force_path_style = true         # required: no per-bucket subdomains
-
-[server]
-listen = "127.0.0.1:8080"
-
-[cache]
-dir = "/var/lib/walgit"
-
-[bundles]
-# Bundle URIs are composed in the bucket with UploadPartCopy, which works, but
-# the bytes still pass through the Nextcloud PHP process. Serve them by proxy
-# rather than handing clients presigned URLs.
-serve_via = "proxy"
-
-[lfs]
-serve_via = "proxy"
-```
-
-Credentials come from the environment, not the config file:
+gits3 configures itself from the environment, there is no config file:
 
 ```bash
-export AWS_ACCESS_KEY_ID=<access-key>
-export AWS_SECRET_ACCESS_KEY=<secret-key>
-walgit serve --config walgit.toml
+GITS3_ENDPOINT=https://<nextcloud-host>/apps/s3_api/s3 \
+GITS3_BUCKET=gittest \
+GITS3_PREFIX=repos/ \
+AWS_ACCESS_KEY_ID=<access-key> \
+AWS_SECRET_ACCESS_KEY=<secret-key> \
+GITS3_USERS="m:<password>:rw" \
+python3 gits3.py
 ```
 
-The API key needs `readwrite` — walgit writes on every push and takes leases during maintenance.
+The API key needs `readwrite` — every push writes packs and rewrites `packed-refs`.
 
 </details>
 
@@ -220,47 +189,38 @@ The API key needs `readwrite` — walgit writes on every push and takes leases d
 
 <br>
 
-walgit's store contract suite runs against any endpoint:
+```bash
+tests/run.sh -k gits3
+```
+
+drives gits3's own S3 client against the endpoint and pushes, clones and garbage-collects a real
+repository through a running gits3 instance. It looks for `../gits3srv/gits3.py` (override with
+`GITS3=…`) and is skipped when it is missing.
+
+A repository in the bucket is a plain bare repo — restore it without gits3:
 
 ```bash
-git clone https://github.com/tobi/walgit && cd walgit
-WALGIT_TEST_S3_ENDPOINT=https://<nextcloud-host>/apps/s3_api/s3/ \
-WALGIT_TEST_BUCKET=<bucket> \
-AWS_ACCESS_KEY_ID=<access-key> \
-AWS_SECRET_ACCESS_KEY=<secret-key> \
-  cargo test -p walgit-store --test contract s3_contract
-```
-
-It covers conditional create/update under 32-way concurrency, conditional and ranged reads,
-delimited listings, an 8 MiB streamed round trip verified by digest, multipart uploads and
-server-side compose.
-
-For an end-to-end check with real git, `bin/README.md` has build instructions for a `walgit`
-binary. Pushing a 2000-commit repository, cloning it back into an empty cache and running
-`git fsck --strict` exercises the whole path — that is where this object layout comes from:
-
-```
-repos/<owner>/<repo>/manifest.pb      # the CAS commit point
-repos/<owner>/<repo>/log/*.pb         # WAL entries
-repos/<owner>/<repo>/wal/*.pack       # packfiles
-repos/<owner>/<repo>/wal/*.idx        # …plus .rev, .bitmap, .commit-graph
+aws s3 sync s3://gittest/repos/foo.git ./foo.git \
+  --endpoint-url https://<nextcloud-host>/apps/s3_api/s3
+git clone ./foo.git
 ```
 
 </details>
 
-**Caveats for this use case:** single-shot uploads are bounded by `post_max_size`,
-`upload_max_filesize` and the web server's body limit (nginx `client_max_body_size`) — multipart
-sidesteps this, which is why the threshold above is lowered. And cron has to run, or abandoned
-uploads are never reclaimed.
+**Caveats for this use case:** a push is one request carrying one pack, stored as one PUT — it is
+bounded by `post_max_size`, `upload_max_filesize` and the web server's body limit (nginx
+`client_max_body_size`). Raise all three plus `fastcgi_read_timeout` and keep `GITS3_MAX_BODY`
+below them; gc writes a pack that knows no push limit, so repack large repositories locally before
+the first push. And cron has to run, or abandoned uploads are never reclaimed.
+
+**CAS is only as good as the ETag.** gits3 fences concurrent pushes by rewriting `packed-refs`
+with `If-Match`. That holds because this app computes ETags from content — Nextcloud's own etag
+has one-second resolution and could accept a lost update (see below).
 
 **`503 SlowDown` under parallel writes.** Writers that race into a folder that does not exist yet
 contend for Nextcloud's file locks while creating it; the losers get `503 SlowDown` before anything
-is written, so a retry is safe and normally succeeds because the folder exists by then. walgit
-relies on the AWS SDK's default retry for this — three attempts per request. Its own
-`store.max_retries` is not read by the S3 backend, so setting it changes nothing. Checked with a
-fault-injecting proxy: one or two `SlowDown` answers in a row per write are absorbed and the push
-and an empty-cache clone come out identical; a third fails the push cleanly with an HTTP 500, and
-nothing half-written is left as the repository's state.
+is written, so a retry is safe and normally succeeds because the folder exists by then. gits3
+retries transient S3 errors, so the usual race resolves on its own.
 
 ---
 

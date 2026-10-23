@@ -1,4 +1,4 @@
-"""Conditional writes: the compare-and-swap primitive gits3 and walgit build on."""
+"""Conditional writes: the compare-and-swap primitive gits3 builds on."""
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
