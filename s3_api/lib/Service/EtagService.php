@@ -69,11 +69,58 @@ class EtagService {
 		return $etag;
 	}
 
+	/**
+	 * Recorded ETags that are still current, for many files in one go.
+	 *
+	 * Unlike get() this never reads content: a file without a current record
+	 * is simply missing from the result, and the caller decides whether it is
+	 * worth hashing.
+	 *
+	 * @param File[] $files
+	 * @return array<int, string> file id => ETag
+	 */
+	public function cachedMany(array $files): array {
+		$byId = [];
+		foreach ($files as $file) {
+			$byId[$file->getId()] = $file;
+		}
+
+		$current = [];
+		foreach (array_chunk(array_keys($byId), 500) as $chunk) {
+			$qb = $this->db->getQueryBuilder();
+			$qb->select('file_id', 'etag', 'file_size', 'file_mtime')
+				->from('s3api_etags')
+				->where($qb->expr()->in('file_id', $qb->createNamedParameter($chunk, IQueryBuilder::PARAM_INT_ARRAY)));
+
+			$result = $qb->executeQuery();
+			while (($row = $result->fetchAssociative()) !== false) {
+				$file = $byId[(int)$row['file_id']] ?? null;
+				if ($file !== null
+					&& (int)$row['file_size'] === $file->getSize()
+					&& (int)$row['file_mtime'] === $file->getMTime()) {
+					$current[$file->getId()] = (string)$row['etag'];
+				}
+			}
+			$result->closeCursor();
+		}
+
+		return $current;
+	}
+
 	public function forget(int $fileId): void {
-		$qb = $this->db->getQueryBuilder();
-		$qb->delete('s3api_etags')
-			->where($qb->expr()->eq('file_id', $qb->createNamedParameter($fileId, IQueryBuilder::PARAM_INT)));
-		$qb->executeStatement();
+		$this->forgetMany([$fileId]);
+	}
+
+	/**
+	 * @param int[] $fileIds
+	 */
+	public function forgetMany(array $fileIds): void {
+		foreach (array_chunk(array_values(array_unique($fileIds)), 500) as $chunk) {
+			$qb = $this->db->getQueryBuilder();
+			$qb->delete('s3api_etags')
+				->where($qb->expr()->in('file_id', $qb->createNamedParameter($chunk, IQueryBuilder::PARAM_INT_ARRAY)));
+			$qb->executeStatement();
+		}
 	}
 
 	private function hashContent(File $file): string {

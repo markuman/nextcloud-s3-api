@@ -1,5 +1,6 @@
 """SigV4 verification, key scoping and permissions."""
 import datetime
+import json
 import secrets
 import time
 import urllib.error
@@ -217,8 +218,11 @@ def test_failed_credentials_are_throttled(occ, sql, env, bucket, prefix):
         client.get(bucket, prefix + "x", secret="wrong")
         S3Client(env.endpoint, "NOSUCHKEY0000000000X", "x").head(bucket, prefix + "x")
         client.get(bucket, prefix + "x", amz_date=stamp(-3600))
-        rows = sql("SELECT COUNT(*) AS n FROM oc_bruteforce_attempts WHERE action = ?", action)
-        assert rows == [{"n": 2}]
+        rows = sql("SELECT metadata FROM oc_bruteforce_attempts WHERE action = ?", action)
+        assert len(rows) == 2
+        # The throttle is per address; the metadata says which key was tried.
+        keys = sorted(json.loads(r["metadata"]).get("accessKey") for r in rows)
+        assert keys == sorted([env.rw.access, "NOSUCHKEY0000000000X"])
     finally:
         occ("config:system:set", "auth.bruteforce.protection.enabled", "--type=boolean", "--value=false")
         occ("config:system:delete", "auth.bruteforce.protection.force.database")

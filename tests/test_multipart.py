@@ -232,3 +232,80 @@ def test_upload_file_with_multipart(boto_factory, s3, bucket, prefix, tmp_path):
     r = s3.get(bucket, prefix + "blob")
     assert r.body == data
     assert r.etag.endswith('-3"')
+
+
+# ---- listing uploads and parts ------------------------------------------------
+
+def test_readonly_cannot_list_uploads_or_parts(boto, s3_ro, bucket, upload):
+    """Uploads in flight are the writers' business: keys, part ETags and sizes
+    of objects that do not exist yet."""
+    key, upload_id = upload
+    put_part(boto, bucket, key, upload_id, 1, b"secret part")
+    r = s3_ro.request("GET", bucket, query={"uploads": ""}, raw_query="uploads")
+    assert r.status == 403
+    assert r.error_code == "AccessDenied"
+    r = s3_ro.request("GET", bucket, key, query={"uploadId": upload_id})
+    assert r.status == 403
+    assert r.error_code == "AccessDenied"
+
+
+def test_list_parts_pages(boto, bucket, upload):
+    key, upload_id = upload
+    for n in (1, 2, 3):
+        put_part(boto, bucket, key, upload_id, n, bytes([n]))
+
+    first = boto.list_parts(Bucket=bucket, Key=key, UploadId=upload_id, MaxParts=2)
+    assert [p["PartNumber"] for p in first["Parts"]] == [1, 2]
+    assert first["IsTruncated"] is True
+    assert first["NextPartNumberMarker"] == 2
+
+    rest = boto.list_parts(Bucket=bucket, Key=key, UploadId=upload_id, PartNumberMarker=2)
+    assert [p["PartNumber"] for p in rest["Parts"]] == [3]
+    assert rest["IsTruncated"] is False
+    # ETags come from the record putPart() made, and match the content.
+    assert rest["Parts"][0]["ETag"] == f'"{hashlib.md5(bytes([3])).hexdigest()}"'
+
+
+def test_list_uploads_pages(boto, bucket, prefix):
+    keys = [prefix + k for k in ("a", "b", "c")]
+    ids = [boto.create_multipart_upload(Bucket=bucket, Key=k)["UploadId"] for k in keys]
+    try:
+        paginator = boto.get_paginator("list_multipart_uploads")
+        pages = list(paginator.paginate(Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": 2}))
+        assert [p["IsTruncated"] for p in pages] == [True, False]
+        assert [u["Key"] for p in pages for u in p.get("Uploads", [])] == keys
+    finally:
+        for k, i in zip(keys, ids):
+            boto.abort_multipart_upload(Bucket=bucket, Key=k, UploadId=i)
+
+
+def test_uploads_in_flight_are_capped(s3, sql, env, bucket, prefix):
+    """Every upload is a row and a folder until it is finished or a week old."""
+    sql("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 999)"
+        " INSERT INTO oc_s3api_uploads (upload_id, bucket_id, object_key, user_id, created_at)"
+        " SELECT printf('%032x', i), ?, ? || 'fake' || i, 'admin', '2030-01-01 00:00:00' FROM n",
+        env.main.id, prefix)
+    try:
+        r = s3.request("POST", bucket, prefix + "one-more", query={"uploads": ""}, raw_query="uploads")
+        assert r.status == 400
+        assert r.error_code == "InvalidRequest"
+    finally:
+        sql("DELETE FROM oc_s3api_uploads WHERE object_key LIKE ?", prefix + "fake%")
+
+
+def test_expired_uploads_make_room_at_the_cap(s3, sql, env, bucket, prefix):
+    """A client that crashed through a thousand uploads must not lock the
+    bucket for the days the cleanup job takes: once they are past their age,
+    a new upload clears some away itself."""
+    sql("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 999)"
+        " INSERT INTO oc_s3api_uploads (upload_id, bucket_id, object_key, user_id, created_at)"
+        " SELECT printf('%032x', i), ?, ? || 'fake' || i, 'admin', '2000-01-01 00:00:00' FROM n",
+        env.main.id, prefix)
+    try:
+        r = s3.request("POST", bucket, prefix + "one-more", query={"uploads": ""}, raw_query="uploads")
+        assert r.status == 200, r.body
+        left = sql("SELECT COUNT(*) AS n FROM oc_s3api_uploads WHERE object_key LIKE ?", prefix + "fake%")
+        assert left == [{"n": 950}]
+        s3.request("DELETE", bucket, prefix + "one-more", query={"uploadId": r.xml().findtext(f"{NS}UploadId")})
+    finally:
+        sql("DELETE FROM oc_s3api_uploads WHERE object_key LIKE ?", prefix + "fake%")

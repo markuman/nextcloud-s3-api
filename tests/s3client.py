@@ -69,9 +69,13 @@ class S3Client:
         return cls(self.host, timeout=120)
 
     def uri(self, bucket=None, key=None):
+        """The percent-encoded request path. A `bytes` key is sent as those
+        exact bytes, so a test can send one that is not UTF-8."""
         path = self.base
         if bucket is not None:
             path += "/" + bucket
+        if isinstance(key, bytes):
+            return quote(path + "/", safe="/-_.~") + urllib.parse.quote(key, safe="/-_.~")
         if key is not None:
             path += "/" + key
         return quote(path, safe="/-_.~")

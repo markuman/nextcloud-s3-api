@@ -112,10 +112,24 @@ class S3RequestBody {
 	 * @param ChunkSignatureVerifier|null $verifier checks the chunk signature
 	 *        chain, binding the bytes to the credential; null when the request
 	 *        carries no chunk signatures
+	 * @param int|null $maxBytes refuse a body that decodes to more than this.
+	 *        Checked against the declared size before anything is read, and
+	 *        again while copying, since neither a chunked body nor one sent
+	 *        without Content-Length has to declare one. Nothing else bounds
+	 *        what lands in the temp directory: post_max_size does not apply
+	 *        to a raw body, and the quota only once it is stored.
 	 * @return resource
-	 * @throws S3AuthException on a malformed chunked body or a bad signature
+	 * @throws S3AuthException on a malformed chunked body, a bad signature or
+	 *         a body over `$maxBytes` (`EntityTooLarge`)
 	 */
-	public function toStream(IRequest $request, &$sha256 = null, $input = null, ?ChunkSignatureVerifier $verifier = null) {
+	public function toStream(IRequest $request, &$sha256 = null, $input = null, ?ChunkSignatureVerifier $verifier = null, ?int $maxBytes = null) {
+		if ($maxBytes !== null) {
+			$declared = $this->getDecodedLength($request);
+			if ($declared !== null && $declared > $maxBytes) {
+				throw $this->tooLarge();
+			}
+		}
+
 		$ownsInput = false;
 		if ($input === null) {
 			$input = fopen('php://input', 'rb');
@@ -138,10 +152,10 @@ class S3RequestBody {
 
 		try {
 			if ($this->isChunked($request)) {
-				$this->copyChunked($input, $out, $hashCtx, $verifier);
+				$this->copyChunked($input, $out, $hashCtx, $verifier, $maxBytes);
 				$this->assertDecodedLength($request, ftell($out));
 			} else {
-				$this->copyRaw($input, $out, $hashCtx);
+				$this->copyRaw($input, $out, $hashCtx, $maxBytes);
 			}
 		} catch (\Throwable $e) {
 			fclose($out);
@@ -158,6 +172,47 @@ class S3RequestBody {
 		$sha256 = hash_final($hashCtx);
 		rewind($out);
 		return $out;
+	}
+
+	/**
+	 * Read a small body, an XML document, into a string.
+	 *
+	 * Goes through toStream(), so an `aws-chunked` body is decoded and its
+	 * chunk signatures are checked like any upload's, and `$sha256` is what
+	 * the handler compares with a literal `x-amz-content-sha256`.
+	 *
+	 * @throws S3AuthException as toStream()
+	 */
+	public function toString(IRequest $request, int $maxBytes, ?ChunkSignatureVerifier $verifier, &$sha256 = null): string {
+		$stream = $this->toStream($request, $sha256, null, $verifier, $maxBytes);
+		try {
+			$body = stream_get_contents($stream);
+		} finally {
+			fclose($stream);
+		}
+
+		if ($body === false) {
+			throw new S3AuthException('InternalError', 'Cannot read request body', Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
+
+		return $body;
+	}
+
+	private function tooLarge(): S3AuthException {
+		return new S3AuthException(
+			'EntityTooLarge',
+			'Your proposed upload exceeds the maximum allowed size',
+			Http::STATUS_BAD_REQUEST,
+		);
+	}
+
+	/**
+	 * @throws S3AuthException when `$total` passes `$maxBytes`
+	 */
+	private function assertWithin(int $total, ?int $maxBytes): void {
+		if ($maxBytes !== null && $total > $maxBytes) {
+			throw $this->tooLarge();
+		}
 	}
 
 	/**
@@ -192,7 +247,8 @@ class S3RequestBody {
 	 * @param resource $out
 	 * @param \HashContext $hashCtx
 	 */
-	private function copyRaw($in, $out, \HashContext $hashCtx): void {
+	private function copyRaw($in, $out, \HashContext $hashCtx, ?int $maxBytes = null): void {
+		$total = 0;
 		while (!feof($in)) {
 			$buf = fread($in, self::CHUNK);
 			if ($buf === false) {
@@ -201,6 +257,8 @@ class S3RequestBody {
 			if ($buf === '') {
 				continue;
 			}
+			$total += strlen($buf);
+			$this->assertWithin($total, $maxBytes);
 			hash_update($hashCtx, $buf);
 			if (fwrite($out, $buf) === false) {
 				throw new S3AuthException('InternalError', 'Failed writing request body', Http::STATUS_INTERNAL_SERVER_ERROR);
@@ -215,7 +273,8 @@ class S3RequestBody {
 	 * @param resource $out
 	 * @param \HashContext $hashCtx
 	 */
-	private function copyChunked($in, $out, \HashContext $hashCtx, ?ChunkSignatureVerifier $verifier = null): void {
+	private function copyChunked($in, $out, \HashContext $hashCtx, ?ChunkSignatureVerifier $verifier = null, ?int $maxBytes = null): void {
+		$total = 0;
 		while (true) {
 			$line = $this->readLine($in);
 			if ($line === null) {
@@ -278,6 +337,11 @@ class S3RequestBody {
 				}
 				return;
 			}
+
+			// The chunk header states its size, so a body that would grow past
+			// the limit is refused before its bytes are read.
+			$total += $size;
+			$this->assertWithin($total, $maxBytes);
 
 			// A signed chunk has to be hashed as a whole to check it, so keep it
 			// aside; chunk sizes are bounded by MAX_CHUNK_SIZE.

@@ -47,11 +47,21 @@ class ObjectLockService {
 	 */
 	private const STALE_AFTER_SECONDS = 900;
 
-	/** Total time to wait for a contended lock. */
-	private const WAIT_TIMEOUT_SECONDS = 10;
+	/**
+	 * Total time to wait for a contended lock.
+	 *
+	 * Every waiting request holds a PHP worker, so a pile of conditional
+	 * writes to one key could otherwise tie up the pool. Past this the
+	 * client gets 503 SlowDown and retries on its own schedule, which every
+	 * S3 client does.
+	 */
+	private const WAIT_TIMEOUT_SECONDS = 3;
 
-	/** Sleep between attempts, in microseconds. */
-	private const RETRY_SLEEP_US = 20_000;
+	/** First sleep between attempts, in microseconds; doubles from there. */
+	private const RETRY_SLEEP_MIN_US = 10_000;
+
+	/** Longest sleep between attempts, in microseconds. */
+	private const RETRY_SLEEP_MAX_US = 250_000;
 
 	public function __construct(
 		private IDBConnection $db,
@@ -80,7 +90,7 @@ class ObjectLockService {
 	 * @throws S3AuthException when the lock cannot be acquired in time
 	 */
 	public function withLock(Folder $bucketFolder, string $objectKey, \Closure $operation) {
-		$lockKey = hash('sha256', $this->pathFor($bucketFolder, $objectKey));
+		$lockKey = hash('sha256', $this->locationFor($bucketFolder, $objectKey));
 
 		$lockId = $this->acquire($lockKey, $objectKey);
 		try {
@@ -91,17 +101,47 @@ class ObjectLockService {
 	}
 
 	/**
-	 * The absolute storage path a key resolves to.
+	 * Where on which storage a key's file lives: `<storage>:<path>`.
 	 *
 	 * Built by concatenation rather than by asking the file for its path: the
 	 * object usually does not exist yet — `If-None-Match: *` is precisely the
 	 * case where it must not — so there is nothing to look up. The bucket
-	 * folder does exist and its path is already normalised by Nextcloud, and
-	 * the key has been through isUsableKey(), which rejects `.`, `..` and
-	 * empty segments. So the join cannot escape the folder.
+	 * folder does exist, and the key has been through isUsableKey(), which
+	 * rejects `.`, `..`, empty segments and other spellings Nextcloud would
+	 * fold into another name. So the join names exactly one file.
+	 *
+	 * The bucket folder is located by its file cache row, not by its path in
+	 * the user's view: a folder shared with Bob is `/alice/files/Proj` for
+	 * Alice and `/bob/files/Shared/Proj` for Bob, and a lock keyed on either
+	 * would not exclude a writer coming through the other. The row holds the
+	 * storage the folder really is on and its path there, the same for
+	 * everyone who can reach it -- and for a share of a subfolder too, since
+	 * the key's remaining segments are appended to the same place. Should the
+	 * lookup fail, the view path is still a lock among this user's buckets.
 	 */
-	private function pathFor(Folder $bucketFolder, string $objectKey): string {
-		return rtrim($bucketFolder->getPath(), '/') . '/' . $objectKey;
+	private function locationFor(Folder $bucketFolder, string $objectKey): string {
+		$location = null;
+		try {
+			$qb = $this->db->getQueryBuilder();
+			$qb->select('storage', 'path')
+				->from('filecache')
+				->where($qb->expr()->eq('fileid', $qb->createNamedParameter($bucketFolder->getId(), IQueryBuilder::PARAM_INT)));
+			$result = $qb->executeQuery();
+			$row = $result->fetchAssociative();
+			$result->closeCursor();
+			if ($row !== false) {
+				$location = $row['storage'] . ':' . rtrim((string)$row['path'], '/');
+			}
+		} catch (\Throwable $e) {
+			$this->logger->warning('Could not locate an S3 bucket folder in the file cache', [
+				'app' => 's3_api',
+				'exception' => $e,
+			]);
+		}
+
+		$location ??= 'view:' . rtrim($bucketFolder->getPath(), '/');
+
+		return $location . '/' . $objectKey;
 	}
 
 	/**
@@ -110,6 +150,7 @@ class ObjectLockService {
 	 */
 	private function acquire(string $lockKey, string $objectKey): int {
 		$deadline = microtime(true) + self::WAIT_TIMEOUT_SECONDS;
+		$sleep = self::RETRY_SLEEP_MIN_US;
 
 		while (true) {
 			$id = $this->tryInsert($lockKey);
@@ -138,7 +179,9 @@ class ObjectLockService {
 				);
 			}
 
-			usleep(self::RETRY_SLEEP_US);
+			// Back off, with jitter so waiters do not retry in lockstep.
+			usleep(random_int(intdiv($sleep, 2), $sleep));
+			$sleep = min($sleep * 2, self::RETRY_SLEEP_MAX_US);
 		}
 	}
 

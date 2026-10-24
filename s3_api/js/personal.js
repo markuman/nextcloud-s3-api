@@ -365,11 +365,19 @@
 			}
 		});
 
+		// The secret is shown once. Clear it from the DOM when the dialog
+		// closes, and when the page is left, so neither a later look at the
+		// page nor the back/forward cache brings it back.
+		function clearSecret() {
+			document.getElementById('s3api-modal-access-key').value = '';
+			document.getElementById('s3api-modal-secret-key').value = '';
+			document.getElementById('s3api-secret-modal').style.display = 'none';
+		}
+
 		document
 			.getElementById('s3api-modal-close')
-			.addEventListener('click', function () {
-				document.getElementById('s3api-secret-modal').style.display = 'none';
-			});
+			.addEventListener('click', clearSecret);
+		window.addEventListener('pagehide', clearSecret);
 
 		loadBuckets();
 	});

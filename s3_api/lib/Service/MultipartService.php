@@ -37,17 +37,62 @@ class MultipartService {
 	 */
 	private const MIN_PART_SIZE = 5 * 1024 * 1024;
 
+	/**
+	 * Uploads one bucket may have in flight. S3 sets no such limit, but here
+	 * every upload is a row and a folder, and an unfinished one is only
+	 * reclaimed after a week: without a bound, a key could pile them up
+	 * faster than cleanup takes them away. Real clients run a handful in
+	 * parallel.
+	 */
+	public const MAX_UPLOADS_PER_BUCKET = 1000;
+
+	/** Multipart uploads untouched for this long are abandoned. */
+	public const UPLOAD_MAX_AGE_SECONDS = 7 * 24 * 3600;
+
+	/**
+	 * Abandoned uploads one CreateMultipartUpload clears away when the
+	 * bucket is at its limit. Each is a folder delete, so a request does
+	 * not take them all on, but every create that hits the limit makes room.
+	 */
+	private const REAP_ON_CREATE = 50;
+
 	public function __construct(
 		private UploadMapper $uploadMapper,
 		private IEventDispatcher $eventDispatcher,
 		private TempFiles $tempFiles,
+		private EtagService $etagService,
 	) {
 	}
 
 	/**
 	 * Begin an upload and return its id.
+	 *
+	 * At the limit, uploads of this bucket that are past their age are
+	 * discarded first, as the cleanup job would. That job only gets to them
+	 * a batch every few hours, and a client that crashed through a thousand
+	 * uploads should not keep the bucket from taking new ones once those
+	 * have expired.
+	 *
+	 * @throws S3AuthException when the bucket has too many uploads in flight
 	 */
-	public function create(int $bucketId, string $userId, string $objectKey): string {
+	public function create(Folder $bucketFolder, int $bucketId, string $userId, string $objectKey): string {
+		// Not atomic with the insert: concurrent creates can overshoot by a
+		// few, which is fine for a bound that only has to stop a pile-up.
+		if ($this->uploadMapper->countByBucket($bucketId) >= self::MAX_UPLOADS_PER_BUCKET) {
+			$cutoff = new \DateTime('@' . (time() - self::UPLOAD_MAX_AGE_SECONDS));
+			foreach ($this->uploadMapper->findOlderThanInBucket($bucketId, $cutoff, self::REAP_ON_CREATE) as $expired) {
+				$this->discard($bucketFolder, $expired);
+			}
+
+			if ($this->uploadMapper->countByBucket($bucketId) >= self::MAX_UPLOADS_PER_BUCKET) {
+				throw new S3AuthException(
+					'InvalidRequest',
+					'Too many multipart uploads in progress for this bucket; complete or abort some first',
+					Http::STATUS_BAD_REQUEST,
+				);
+			}
+		}
+
 		$uploadId = bin2hex(random_bytes(16));
 
 		$upload = new Upload();
@@ -113,7 +158,9 @@ class MultipartService {
 			if (!($existing instanceof File)) {
 				throw new S3AuthException('InternalError', 'Part path is not a file', Http::STATUS_INTERNAL_SERVER_ERROR);
 			}
+			$existingId = $existing->getId();
 			$this->deleteForGood($existing);
+			$this->etagService->forget($existingId);
 		} catch (NotFoundException) {
 			// First upload of this part.
 		}
@@ -121,16 +168,10 @@ class MultipartService {
 		$file = $folder->newFile($name, $stream);
 
 		// The part ETag is the MD5 of its bytes, because CompleteMultipartUpload
-		// derives the final ETag from the part ETags.
-		$handle = $file->fopen('rb');
-		if ($handle === false) {
-			throw new S3AuthException('InternalError', 'Cannot read stored part', Http::STATUS_INTERNAL_SERVER_ERROR);
-		}
-		$ctx = hash_init('md5');
-		hash_update_stream($ctx, $handle);
-		fclose($handle);
-
-		return hash_final($ctx);
+		// derives the final ETag from the part ETags. Recorded like an
+		// object's, so ListParts and Complete look it up instead of reading
+		// every part again on each call.
+		return $this->etagService->refresh($file);
 	}
 
 	/**
@@ -154,18 +195,12 @@ class MultipartService {
 				continue;
 			}
 
-			$handle = $node->fopen('rb');
-			if ($handle === false) {
-				continue;
-			}
-			$ctx = hash_init('md5');
-			hash_update_stream($ctx, $handle);
-			fclose($handle);
-
 			$parts[$number] = [
 				'number' => $number,
 				'size' => $node->getSize(),
-				'etag' => hash_final($ctx),
+				// Recorded by putPart(); only a part changed behind our back
+				// is hashed again.
+				'etag' => $this->etagService->get($node),
 				'mtime' => $node->getMTime(),
 			];
 		}
@@ -250,6 +285,23 @@ class MultipartService {
 			throw new S3AuthException('NoSuchUpload', 'Upload data is gone', Http::STATUS_NOT_FOUND);
 		}
 
+		// The object is assembled in the temp directory first and then stored
+		// next to its parts, so it needs its full size in free space while
+		// they still take theirs. Better to say so now than after copying it
+		// all into a temp file only for the quota to refuse it.
+		$total = 0;
+		foreach ($requested as $part) {
+			$total += $available[$part['number']]['size'];
+		}
+		$free = $bucketFolder->getFreeSpace();
+		if ((is_int($free) || is_float($free)) && $free >= 0 && $total > $free) {
+			throw new S3AuthException(
+				'EntityTooLarge',
+				'Not enough free space to assemble the object',
+				Http::STATUS_BAD_REQUEST,
+			);
+		}
+
 		// Assemble into a temp stream, then hand the finished bytes to the
 		// storage in one call so the object never exists half-written.
 		$assembled = $this->tempFiles->open();
@@ -308,7 +360,13 @@ class MultipartService {
 	public function discard(Folder $bucketFolder, Upload $upload): void {
 		$folder = $this->partFolder($bucketFolder, $upload->getUploadId(), false);
 		if ($folder !== null) {
+			// The parts' recorded ETags go with them: file ids are reused.
+			$partIds = [];
+			foreach ($folder->getDirectoryListing() as $node) {
+				$partIds[] = $node->getId();
+			}
 			$this->deleteForGood($folder);
+			$this->etagService->forgetMany($partIds);
 		}
 
 		$this->pruneScratchRoot($bucketFolder);
@@ -345,10 +403,12 @@ class MultipartService {
 	}
 
 	/**
+	 * One page of a bucket's uploads, plus one more if there is a next page.
+	 *
 	 * @return Upload[]
 	 */
-	public function listUploads(int $bucketId): array {
-		return $this->uploadMapper->findByBucket($bucketId);
+	public function listUploads(int $bucketId, string $prefix, string $keyMarker, string $uploadIdMarker, int $maxUploads): array {
+		return $this->uploadMapper->findByBucketPage($bucketId, $prefix, $keyMarker, $uploadIdMarker, $maxUploads + 1);
 	}
 
 	/**

@@ -31,11 +31,11 @@ Util::addScript('s3_api', 'personal');
 			<p><strong><?php p($l->t('Save these credentials now. The secret key will not be shown again!')); ?></strong></p>
 			<div style="margin:12px 0;">
 				<label for="s3api-modal-access-key"><?php p($l->t('Access Key:')); ?></label>
-				<input type="text" id="s3api-modal-access-key" readonly style="width:100%; font-family:monospace;" />
+				<input type="text" id="s3api-modal-access-key" readonly autocomplete="off" spellcheck="false" style="width:100%; font-family:monospace;" />
 			</div>
 			<div style="margin:12px 0;">
 				<label for="s3api-modal-secret-key"><?php p($l->t('Secret Key:')); ?></label>
-				<input type="text" id="s3api-modal-secret-key" readonly style="width:100%; font-family:monospace;" />
+				<input type="text" id="s3api-modal-secret-key" readonly autocomplete="off" spellcheck="false" style="width:100%; font-family:monospace;" />
 			</div>
 			<button id="s3api-modal-close" class="primary"><?php p($l->t('I have saved these credentials')); ?></button>
 		</div>

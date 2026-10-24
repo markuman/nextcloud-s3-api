@@ -73,7 +73,7 @@ class S3AuthService {
 	}
 
 	/**
-	 * @return array{userId: string, bucketId: int, permission: string, accessKey: string, chunkVerifier: ?ChunkSignatureVerifier}
+	 * @return array{userId: string, bucketId: int, permission: string, accessKey: string, signedHeaders: string[], chunkVerifier: ?ChunkSignatureVerifier}
 	 * @throws S3AuthException
 	 */
 	public function authenticate(IRequest $request): array {
@@ -83,6 +83,21 @@ class S3AuthService {
 			? $this->parseQueryAuth($query)
 			: $this->parseHeaderAuth((string)$request->getHeader('Authorization'));
 
+		try {
+			return $this->authenticateParsed($request, $parsed, $query);
+		} catch (S3AuthException $e) {
+			$e->setAccessKey($parsed['accessKey']);
+			throw $e;
+		}
+	}
+
+	/**
+	 * @param array{accessKey: string, date: string, region: string, signedHeaders: string[], signature: string, presigned: bool, amzDate: string, expires: ?int} $parsed
+	 * @param array<string, string> $query
+	 * @return array{userId: string, bucketId: int, permission: string, accessKey: string, signedHeaders: string[], chunkVerifier: ?ChunkSignatureVerifier}
+	 * @throws S3AuthException
+	 */
+	private function authenticateParsed(IRequest $request, array $parsed, array $query): array {
 		$apiKey = $this->apiKeyService->findByAccessKey($parsed['accessKey']);
 		// A disabled account keeps its rows, but must lose access along with
 		// its login. Nothing on the way to the files checks that:
@@ -104,6 +119,7 @@ class S3AuthService {
 			'bucketId' => $apiKey->getBucketId(),
 			'permission' => $apiKey->getPermission(),
 			'accessKey' => $apiKey->getAccessKey(),
+			'signedHeaders' => $parsed['signedHeaders'],
 			'chunkVerifier' => $this->chunkVerifierFor($request, $parsed, $secretKey),
 		];
 	}
@@ -116,7 +132,7 @@ class S3AuthService {
 	 * the per-chunk signatures. Requests without them (`UNSIGNED-PAYLOAD`
 	 * variants, or a literal hash) get no verifier.
 	 */
-	private function chunkVerifierFor(IRequest $request, array $parsed, string $secretKey): ?ChunkSignatureVerifier {
+	private function chunkVerifierFor(IRequest $request, array $parsed, #[\SensitiveParameter] string $secretKey): ?ChunkSignatureVerifier {
 		$payloadHash = strtoupper(trim((string)$request->getHeader('x-amz-content-sha256')));
 		if (!str_starts_with($payloadHash, 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) {
 			return null;
@@ -365,7 +381,7 @@ class S3AuthService {
 	 * @param array<string, string> $query
 	 * @throws S3AuthException
 	 */
-	private function verifySignature(IRequest $request, array $parsed, string $secretKey, array $query): void {
+	private function verifySignature(IRequest $request, array $parsed, #[\SensitiveParameter] string $secretKey, array $query): void {
 		$canonicalRequest = $this->buildCanonicalRequest($request, $parsed, $query);
 		$stringToSign = $this->buildStringToSign($request, $parsed, $canonicalRequest);
 		$signingKey = $this->deriveSigningKey($secretKey, $parsed['date'], $parsed['region']);
@@ -495,7 +511,13 @@ class S3AuthService {
 		]);
 	}
 
-	private function deriveSigningKey(string $secretKey, string $date, string $region): string {
+	/**
+	 * Secrets are marked #[\SensitiveParameter] wherever they are passed: the
+	 * catch-all error handler logs the exception, and Nextcloud writes the
+	 * arguments of every stack frame into the log unless the method is on its
+	 * own short list of sensitive ones.
+	 */
+	private function deriveSigningKey(#[\SensitiveParameter] string $secretKey, string $date, string $region): string {
 		$dateKey = hash_hmac('sha256', $date, 'AWS4' . $secretKey, true);
 		$regionKey = hash_hmac('sha256', $region, $dateKey, true);
 		$serviceKey = hash_hmac('sha256', 's3', $regionKey, true);

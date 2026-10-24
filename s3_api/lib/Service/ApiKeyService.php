@@ -72,7 +72,7 @@ class ApiKeyService {
 	 * @throws DoesNotExistException when the key is not the user's, or does not
 	 *         belong to that bucket
 	 */
-	public function deleteKey(int $keyId, int $bucketId, string $userId): void {
+	public function deleteKey(int $keyId, int $bucketId, string $userId): ApiKey {
 		$key = $this->apiKeyMapper->findByIdAndUser($keyId, $userId);
 
 		// The bucket is part of the route, so honour it instead of deleting a
@@ -82,6 +82,7 @@ class ApiKeyService {
 		}
 
 		$this->apiKeyMapper->delete($key);
+		return $key;
 	}
 
 	public function findByAccessKey(string $accessKey): ?ApiKey {

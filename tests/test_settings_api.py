@@ -147,3 +147,29 @@ def test_deleting_a_bucket_revokes_its_keys_and_keeps_the_files(nc, env, folder)
     assert nc.api("DELETE", f"/buckets/{b['id']}").status == 200
     assert client.get(b["bucketName"], "kept.txt").error_code == "InvalidAccessKeyId"
     assert nc.download(f"{folder}/kept.txt").body == b"still here"
+
+
+def test_nfd_spelling_of_a_bucket_folder_conflicts(nc, env):
+    """Nextcloud resolves the NFD spelling to the same folder; the overlap
+    check used to compare the strings."""
+    parent = f"s3t-{env.run_id}-caf\u00e9-{secrets.token_hex(2)}"
+    nc.mkcol(parent)
+    nc.create_bucket("/" + parent, name())
+    r = nc.api("POST", "/buckets", {"folderPath": "/" + parent.replace("\u00e9", "e\u0301"), "bucketName": name()})
+    assert r.status == 409, r.body
+
+
+@pytest.mark.parametrize("payload", [
+    {"permission": "readonly", "label": "x" * 256},
+    {"permission": ["readonly"]},
+    {"permission": "readonly", "label": {"a": 1}},
+], ids=["label-too-long", "permission-not-a-string", "label-not-a-string"])
+def test_bad_key_parameters_are_client_errors(nc, folder, payload):
+    """Used to be a database error or a TypeError: a 500."""
+    b = nc.create_bucket("/" + folder, name())
+    assert nc.api("POST", f"/buckets/{b['id']}/keys", payload).status == 400
+
+
+def test_bad_bucket_parameters_are_client_errors(nc, folder):
+    assert nc.api("POST", "/buckets", {"folderPath": ["/" + folder], "bucketName": name()}).status == 400
+    assert nc.api("POST", "/buckets", {"folderPath": "/" + folder, "bucketName": 123}).status == 400

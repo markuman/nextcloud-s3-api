@@ -36,7 +36,12 @@ class ChunkSignatureVerifier {
 	/** Rolling signature: the seed to begin with, then each chunk's own. */
 	private string $previousSignature;
 
+	private string $signingKey;
+
 	/**
+	 * Not a promoted parameter: #[\SensitiveParameter] keeps the key out of
+	 * logged stack traces, and is only allowed on plain parameters.
+	 *
 	 * @param string $seedSignature the signature from the Authorization header
 	 * @param string $signingKey derived key for the request's scope
 	 * @param string $amzDate the request timestamp, as signed
@@ -44,10 +49,11 @@ class ChunkSignatureVerifier {
 	 */
 	public function __construct(
 		string $seedSignature,
-		private string $signingKey,
+		#[\SensitiveParameter] string $signingKey,
 		private string $amzDate,
 		private string $scope,
 	) {
+		$this->signingKey = $signingKey;
 		$this->previousSignature = strtolower($seedSignature);
 	}
 

@@ -9,8 +9,6 @@ use OCA\S3Api\Db\UploadMapper;
 use OCP\AppFramework\Db\DoesNotExistException;
 use OCP\DB\QueryBuilder\IQueryBuilder;
 use OCP\Files\Folder;
-use OCP\Files\IRootFolder;
-use OCP\Files\NotFoundException;
 use OCP\IDBConnection;
 use Psr\Log\LoggerInterface;
 
@@ -24,8 +22,12 @@ use Psr\Log\LoggerInterface;
  */
 class CleanupService {
 
-	/** Multipart uploads untouched for this long are abandoned. */
-	private const UPLOAD_MAX_AGE_SECONDS = 7 * 24 * 3600;
+	/**
+	 * Abandoned uploads discarded per run. Each one is a folder delete on
+	 * the owner's storage; the job runs every few hours, so a backlog drains
+	 * over a few runs instead of one run holding cron for an hour.
+	 */
+	private const UPLOADS_PER_RUN = 200;
 
 	/**
 	 * Locks older than this are swept. Well above the point where
@@ -38,8 +40,8 @@ class CleanupService {
 		private IDBConnection $db,
 		private UploadMapper $uploadMapper,
 		private BucketMapper $bucketMapper,
+		private BucketService $bucketService,
 		private MultipartService $multipartService,
-		private IRootFolder $rootFolder,
 		private LoggerInterface $logger,
 	) {
 	}
@@ -56,10 +58,10 @@ class CleanupService {
 	}
 
 	private function pruneUploads(): int {
-		$cutoff = new \DateTime('@' . (time() - self::UPLOAD_MAX_AGE_SECONDS));
+		$cutoff = new \DateTime('@' . (time() - MultipartService::UPLOAD_MAX_AGE_SECONDS));
 
 		$removed = 0;
-		foreach ($this->uploadMapper->findOlderThan($cutoff) as $upload) {
+		foreach ($this->uploadMapper->findOlderThan($cutoff, self::UPLOADS_PER_RUN) as $upload) {
 			$folder = $this->bucketFolder($upload->getBucketId(), $upload->getUserId());
 
 			try {
@@ -148,12 +150,6 @@ class CleanupService {
 			return null;
 		}
 
-		try {
-			$node = $this->rootFolder->getUserFolder($userId)->get($bucket->getFolderPath());
-		} catch (NotFoundException | \OCP\Files\NotPermittedException) {
-			return null;
-		}
-
-		return $node instanceof Folder ? $node : null;
+		return $this->bucketService->resolveFolder($bucket);
 	}
 }

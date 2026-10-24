@@ -3,6 +3,84 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
+## 1.6.2 – 2026-10-24
+
+**Hardening release.** No new features: this works through a security review of 1.6.1 — no
+critical or high findings, a set of medium and low ones, all addressed. Updating is recommended.
+It carries one migration, which binds existing buckets to their folder's file id (see the first
+entry). Operator-visible: buckets on shares newer than the bucket stay unbound,
+`DeleteObjects` needs a signed checksum or payload hash, keys that are not NFC are refused, and
+uploads are bounded by 5 GiB and the owner's free space.
+
+### Security
+- **A bucket was its folder's path, checked once at creation.** Renamed, the folder stopped being
+  served; whatever later appeared under the old name was served instead — a new folder, or a
+  folder another user shared, which Nextcloud mounts under its own name. A key handed to a third
+  party then read and wrote the other user's files. Buckets are now bound to the folder's file id
+  and follow it through renames and moves; a folder in the trash answers `NoSuchBucket`. The
+  migration binds existing buckets to what their path names now — except an incoming share that
+  is newer than the bucket, since that is what the attack looks like once it has happened.
+  **Operator-visible:** such a bucket, one on a federated share, and one whose folder cannot be
+  found stay unbound with a warning in the log; binding is retried on first use by the same rule,
+  otherwise the owner registers the folder again. Buckets on the owner's folders, group folders,
+  external storage and on shares older than the bucket bind as before.
+- **The XML bodies of `DeleteObjects` and `CompleteMultipartUpload` were not bound to the
+  signature.** They were read raw, without checking `x-amz-content-sha256`, so a captured request
+  could be replayed within its fifteen minutes with another body: other keys deleted, another part
+  list assembled. They are now read like uploads (decoded, chunk signatures checked) and checked
+  against every claim the request makes about them — the payload hash, `Content-MD5`, and for
+  `DeleteObjects` `x-amz-checksum-*` (CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256). `DeleteObjects`
+  also has to carry one the signature covers, as S3 requires a checksum there; a request with
+  `UNSIGNED-PAYLOAD` and nothing else is refused with `InvalidRequest`. A checksum sent as an
+  `aws-chunked` trailer (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`) does not count, as trailers are not
+  read; it takes a signed header or a literal payload hash.
+- **Keys in another Unicode normalisation, or not UTF-8 at all, were accepted.** Nextcloud stores
+  names in NFC, so the NFD spelling of `é` was a second name for the same file: with a lock of its
+  own, so two `If-None-Match: *` writes could both win; past the self-copy guard, which with file
+  locking off truncated the object; past the bucket overlap check. Bytes that are not UTF-8 ended in
+  a database error. Such keys, and keys with control characters, are refused with
+  `InvalidArgument`. The overlap check compares folders by where they are now, NFC. Self-copy is
+  detected by file id, which also covers case-insensitive storages.
+- **Request bodies had no size limit of the app's own.** A body went to the temp directory in full
+  before the quota was looked at, so one upload could fill it for the whole instance; XML bodies
+  were held in memory and parsed whatever their size. `PutObject` and `UploadPart` now take at most
+  5 GiB, as on S3, and no more than the bucket owner's free space (`403 AccessDenied`) — checked on
+  the declared length before reading, and while reading. XML bodies stop at 4 MiB
+  (`MaxMessageLengthExceeded`), `CompleteMultipartUpload` at 10000 parts. Completion checks the
+  free space before assembling.
+- **Listings hashed every file without a recorded ETag, in full.** A readonly key could make one
+  `GET` read a thousand large files. A page now hashes at most 256 MiB; past that, files are listed
+  with Nextcloud's etag plus `-0` until their content ETag is known — the suffix keeps tools from
+  taking it for an MD5, which on some storages it looks like. A conditional write computes a missing
+  ETag before taking the object lock, not while holding it.
+- **`ListParts` re-read every part on each call**, and `CompleteMultipartUpload` read them three
+  times. Part ETags are recorded when the part is stored.
+- `ListParts` and `ListMultipartUploads` need a readwrite key.
+- The object lock is keyed on where the file really is (storage and path in it), not on the
+  owner's view of it, so a writer coming through a share and one through the owner's own bucket
+  now exclude each other.
+- A request URI that does not account for the routed path is refused (`InvalidURI`) instead of
+  falling back to the routed path, which is the one that may have lost a slash.
+- XML responses replace what XML cannot carry instead of producing an unparseable document or an
+  empty value.
+- Secrets are marked `#[\SensitiveParameter]`, so a logged stack trace does not carry them. The
+  settings page clears a new secret from the page when its dialog closes.
+
+### Changed
+- **Operator-visible:** a contended conditional write waits up to three seconds for the object
+  lock, not ten, with backoff, before answering `503 SlowDown`.
+- Failed signatures and unknown keys are logged as warnings with the key and address, and the
+  brute force entry carries the key. Bucket and key changes and `DeleteObjects` are logged at info
+  level and to `admin_audit`.
+- `ListParts` and `ListMultipartUploads` page (`max-parts`/`part-number-marker`,
+  `max-uploads`/`key-marker`/`upload-id-marker`, `prefix`). At most 1000 uploads per bucket may be
+  in flight; a bucket at that limit discards its expired uploads itself when the next one starts.
+  Cleanup reclaims abandoned uploads 200 per run.
+- The settings API answers `400` instead of `500` to parameters of the wrong type and to labels
+  over 255 characters.
+- Files whose names no key can spell are left out of listings.
+- README: `trusted_proxies` behind a reverse proxy, room for `tempdirectory`.
+
 ## 1.6.1 – 2026-10-23
 
 ### Fixed

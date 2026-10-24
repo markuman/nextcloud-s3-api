@@ -2,6 +2,7 @@
 import hashlib
 import os
 import re
+import urllib.parse
 
 import pytest
 
@@ -130,6 +131,46 @@ def test_backslash_is_not_a_second_separator(s3, bucket, prefix):
     assert r.status == 400
     assert r.error_code == "InvalidArgument"
     assert s3.get(bucket, prefix + "a/b").body == b"keep"
+
+
+NFC, NFD = "\u00e9", "e\u0301"  # é, composed and decomposed
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "PUT", "DELETE"])
+def test_nfd_key_is_not_a_second_name(s3, bucket, prefix, method):
+    """Nextcloud stores names in NFC, so the NFD spelling reached the same
+    file -- under a lock of its own, and past the self-copy guard."""
+    s3.put(bucket, prefix + NFC, b"keep")
+    r = s3.request(method, bucket, prefix + NFD, b"overwrite" if method == "PUT" else b"")
+    assert r.status == 400
+    if method != "HEAD":
+        assert r.error_code == "InvalidArgument"
+    assert s3.get(bucket, prefix + NFC).body == b"keep"
+    assert s3.list_all(bucket, prefix) == [prefix + NFC]
+
+
+def test_nfd_copy_source_does_not_truncate(s3, bucket, prefix):
+    s3.put(bucket, prefix + NFC, b"keep")
+    r = s3.put(bucket, prefix + NFC, headers={"x-amz-copy-source": urllib.parse.quote(f"{bucket}/{prefix}{NFD}")})
+    assert r.status == 400
+    assert s3.get(bucket, prefix + NFC).body == b"keep"
+
+
+@pytest.mark.parametrize("name", ["a\x01b", "tab\there", "new\nline", "cr\rlf", "del\x7f", "nonchar\uffff"])
+def test_key_with_control_character_is_rejected(s3, bucket, prefix, name):
+    """XML 1.0 cannot carry them, so such a key would break the listing of
+    its prefix for every client. The error response itself stays XML."""
+    r = s3.put(bucket, prefix + name, b"x")
+    assert r.status == 400
+    assert r.error_code == "InvalidArgument"
+    assert r.xml().findtext("Resource")
+
+
+def test_key_that_is_not_utf8_is_rejected(s3, bucket, prefix):
+    """Used to reach the database, which refuses such a string: a 500."""
+    r = s3.put(bucket, prefix.encode() + b"caf\xe9", b"x")
+    assert r.status == 400
+    assert r.error_code == "InvalidArgument"
 
 
 def test_key_length_limit(s3, bucket, prefix):

@@ -17,6 +17,12 @@ class S3ResponseBuilder {
 	/** S3 never returns more than this, whatever the client asks for. */
 	private const MAX_KEYS_LIMIT = 1000;
 
+	/**
+	 * Bytes one listing page may read to compute missing ETags. See
+	 * withEtags().
+	 */
+	private const LISTING_HASH_BUDGET_BYTES = 256 * 1024 * 1024;
+
 	public function __construct(
 		private EtagService $etagService,
 	) {
@@ -141,18 +147,32 @@ class S3ResponseBuilder {
 	}
 
 	/**
+	 * One page of ListParts.
+	 *
 	 * @param array<int, array{number: int, size: int, etag: string, mtime: int}> $parts
+	 *        the parts on this page, in order
 	 */
-	public function listPartsXml(string $bucketName, string $key, string $uploadId, array $parts): string {
+	public function listPartsXml(
+		string $bucketName,
+		string $key,
+		string $uploadId,
+		array $parts,
+		int $partNumberMarker,
+		int $maxParts,
+		bool $truncated,
+	): string {
 		$xml = '<?xml version="1.0" encoding="UTF-8"?>';
 		$xml .= '<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
 		$xml .= '<Bucket>' . $this->escape($bucketName) . '</Bucket>';
 		$xml .= '<Key>' . $this->escape($key) . '</Key>';
 		$xml .= '<UploadId>' . $this->escape($uploadId) . '</UploadId>';
 		$xml .= '<StorageClass>STANDARD</StorageClass>';
-		$xml .= '<PartNumberMarker>0</PartNumberMarker>';
-		$xml .= '<MaxParts>1000</MaxParts>';
-		$xml .= '<IsTruncated>false</IsTruncated>';
+		$xml .= '<PartNumberMarker>' . $partNumberMarker . '</PartNumberMarker>';
+		if ($truncated && $parts !== []) {
+			$xml .= '<NextPartNumberMarker>' . $parts[array_key_last($parts)]['number'] . '</NextPartNumberMarker>';
+		}
+		$xml .= '<MaxParts>' . $maxParts . '</MaxParts>';
+		$xml .= '<IsTruncated>' . ($truncated ? 'true' : 'false') . '</IsTruncated>';
 
 		foreach ($parts as $part) {
 			$xml .= '<Part>';
@@ -168,16 +188,34 @@ class S3ResponseBuilder {
 	}
 
 	/**
-	 * @param Upload[] $uploads
+	 * One page of ListMultipartUploads.
+	 *
+	 * @param Upload[] $uploads the uploads on this page, in order
 	 */
-	public function listMultipartUploadsXml(string $bucketName, array $uploads): string {
+	public function listMultipartUploadsXml(
+		string $bucketName,
+		array $uploads,
+		string $prefix,
+		string $keyMarker,
+		string $uploadIdMarker,
+		int $maxUploads,
+		bool $truncated,
+	): string {
 		$xml = '<?xml version="1.0" encoding="UTF-8"?>';
 		$xml .= '<ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
 		$xml .= '<Bucket>' . $this->escape($bucketName) . '</Bucket>';
-		$xml .= '<KeyMarker></KeyMarker>';
-		$xml .= '<UploadIdMarker></UploadIdMarker>';
-		$xml .= '<MaxUploads>1000</MaxUploads>';
-		$xml .= '<IsTruncated>false</IsTruncated>';
+		$xml .= '<KeyMarker>' . $this->escape($keyMarker) . '</KeyMarker>';
+		$xml .= '<UploadIdMarker>' . $this->escape($uploadIdMarker) . '</UploadIdMarker>';
+		if ($truncated && $uploads !== []) {
+			$last = $uploads[array_key_last($uploads)];
+			$xml .= '<NextKeyMarker>' . $this->escape($last->getObjectKey()) . '</NextKeyMarker>';
+			$xml .= '<NextUploadIdMarker>' . $this->escape($last->getUploadId()) . '</NextUploadIdMarker>';
+		}
+		if ($prefix !== '') {
+			$xml .= '<Prefix>' . $this->escape($prefix) . '</Prefix>';
+		}
+		$xml .= '<MaxUploads>' . $maxUploads . '</MaxUploads>';
+		$xml .= '<IsTruncated>' . ($truncated ? 'true' : 'false') . '</IsTruncated>';
 
 		foreach ($uploads as $upload) {
 			$xml .= '<Upload>';
@@ -324,7 +362,7 @@ class S3ResponseBuilder {
 		}
 
 		return [
-			'objects' => $objects,
+			'objects' => $this->withEtags($objects),
 			'commonPrefixes' => $commonPrefixes,
 			'truncated' => $truncated,
 			'next' => $next,
@@ -332,7 +370,7 @@ class S3ResponseBuilder {
 	}
 
 	/**
-	 * @param list<array{key: string, lastModified: string, etag: string, size: int}> $objects
+	 * @param list<array{key: string, lastModified: string, size: int, file: File}> $objects
 	 * @param list<string> $commonPrefixes
 	 */
 	private function walk(
@@ -372,6 +410,15 @@ class S3ResponseBuilder {
 
 			// The multipart scratch area is internal and must never be listed.
 			if ($folderKey === '' && $name === MultipartService::SCRATCH_DIR) {
+				continue;
+			}
+
+			// A name no key can spell -- not NFC, a control character, a
+			// backslash, put there through WebDAV or straight on the disk --
+			// is an object nobody could GET. Listing it anyway would at best
+			// hand out a key that 400s, and a control character would make
+			// the whole page unparseable for every client.
+			if (!KeyRules::isPlainSegment($name)) {
 				continue;
 			}
 
@@ -425,17 +472,71 @@ class S3ResponseBuilder {
 				}
 			}
 
+			// The ETag is filled in once the page is cut to size, see
+			// withEtags(): the walk overshoots by one key, and that one need
+			// not be hashed.
 			$objects[] = [
 				'key' => $key,
 				'lastModified' => gmdate('Y-m-d\TH:i:s.000\Z', $node->getMTime()),
-				'etag' => $this->etagService->get($node),
 				'size' => $node->getSize(),
+				'file' => $node,
 			];
 
 			if (count($objects) > $maxKeys) {
 				return;
 			}
 		}
+	}
+
+	/**
+	 * Attach an ETag to every object on a listing page.
+	 *
+	 * Recorded ETags are looked up for the whole page in one query. A file
+	 * without one -- written through WebDAV, the web UI or the sync client,
+	 * or changed there since -- needs its content hashed, and that is a read
+	 * of the whole file: a page of a thousand large files written outside
+	 * this API would be terabytes of I/O for one GET, a readonly key enough
+	 * to ask for it in a loop. So hashing is capped per page at
+	 * LISTING_HASH_BUDGET_BYTES; files past the cap get their content ETag on
+	 * a later listing or on the first GET or HEAD. Reads and conditional
+	 * writes always hash: they need the exact value.
+	 *
+	 * Until then they are listed with Nextcloud's own etag plus `-0`. The
+	 * suffix matters: on some storages -- object storage as primary, for one
+	 * -- Nextcloud's etag is 32 hex digits, which a client would take for the
+	 * content MD5 and find wrong, and re-upload. A dash marks an S3 ETag as
+	 * not an MD5 (it is how multipart ETags look), so tools skip comparing
+	 * it, and zero parts is a count no real multipart object has.
+	 *
+	 * @param list<array{key: string, lastModified: string, size: int, file: File}> $objects
+	 * @return list<array{key: string, lastModified: string, etag: string, size: int}>
+	 */
+	private function withEtags(array $objects): array {
+		$cached = $this->etagService->cachedMany(array_column($objects, 'file'));
+		$budget = self::LISTING_HASH_BUDGET_BYTES;
+
+		$out = [];
+		foreach ($objects as $obj) {
+			$file = $obj['file'];
+			$etag = $cached[$file->getId()] ?? null;
+			if ($etag === null) {
+				if ($obj['size'] <= $budget) {
+					$budget -= $obj['size'];
+					$etag = $this->etagService->refresh($file);
+				} else {
+					$etag = trim($file->getEtag(), '"') . '-0';
+				}
+			}
+
+			$out[] = [
+				'key' => $obj['key'],
+				'lastModified' => $obj['lastModified'],
+				'etag' => $etag,
+				'size' => $obj['size'],
+			];
+		}
+
+		return $out;
 	}
 
 	/**
@@ -504,7 +605,23 @@ class S3ResponseBuilder {
 		return min($maxKeys, self::MAX_KEYS_LIMIT);
 	}
 
+	/**
+	 * Escape a value for an XML text node or attribute.
+	 *
+	 * Whatever the value holds, the document has to stay parseable: one bad
+	 * byte breaks the response for every client, not just the value it is
+	 * in. Invalid UTF-8 is replaced rather than turned into an empty string,
+	 * which htmlspecialchars() does without ENT_SUBSTITUTE, and characters
+	 * XML 1.0 cannot carry at all -- control characters echoed from a
+	 * request, say, in an error's `<Resource>` -- become U+FFFD as well.
+	 */
 	private function escape(string $value): string {
-		return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+		$escaped = htmlspecialchars($value, ENT_XML1 | ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+		return preg_replace(
+			'/[^\x{9}\x{A}\x{D}\x{20}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u',
+			"\u{FFFD}",
+			$escaped,
+		) ?? '';
 	}
 }

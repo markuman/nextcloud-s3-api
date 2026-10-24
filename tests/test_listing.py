@@ -191,3 +191,11 @@ def test_prefix_cannot_leave_or_alias_the_bucket(s3, s3_ro, boto, env, bucket, p
         assert s3.list_all(bucket, prefix + "a/") == [prefix + "a/x"]
     finally:
         boto.abort_multipart_upload(Bucket=bucket, Key=prefix + "big", UploadId=upload["UploadId"])
+
+
+def test_nfd_prefix_matches_nothing(s3, bucket, prefix):
+    """Stored names are NFC; an NFD folder in the prefix would otherwise be
+    resolved to the NFC folder and list its keys under names that 400."""
+    put_many(s3, bucket, [prefix + "caf\u00e9/x"])
+    assert s3.list_all(bucket, prefix + "cafe\u0301/") == []
+    assert s3.list_all(bucket, prefix + "caf\u00e9/") == [prefix + "caf\u00e9/x"]

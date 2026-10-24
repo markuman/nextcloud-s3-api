@@ -99,6 +99,15 @@ API key. Note down both keys; the secret is shown once.
   release and tested against the daily master build
 * **Nextcloud's cron must run** — abandoned multipart uploads are only reclaimed by a background
   job
+* **Behind a reverse proxy, set `trusted_proxies`** (and `forwarded_for_headers` if needed) in
+  `config.php`. Failed S3 signatures count towards Nextcloud's brute force protection, which is
+  per client address; without it every request seems to come from the proxy, and a few dozen
+  wrong secrets from anywhere slow down — and eventually lock out — every S3 client of the
+  instance
+* **Give `tempdirectory` room, ideally its own volume.** Every upload is written there in full
+  before Nextcloud stores it, and a multipart upload is assembled there on completion. The app
+  bounds a single body (5 GiB, and the free space of the bucket owner), but parallel uploads add
+  up
 * `app:enable` runs the migrations. `occ upgrade` is for core upgrades and will not touch an app.
   To update after bumping the version: `occ app:disable s3_api && occ app:enable s3_api`
 
@@ -209,9 +218,10 @@ git clone ./foo.git
 
 **Caveats for this use case:** a push is one request carrying one pack, stored as one PUT — it is
 bounded by `post_max_size`, `upload_max_filesize` and the web server's body limit (nginx
-`client_max_body_size`). Raise all three plus `fastcgi_read_timeout` and keep `GITS3_MAX_BODY`
-below them; gc writes a pack that knows no push limit, so repack large repositories locally before
-the first push. And cron has to run, or abandoned uploads are never reclaimed.
+`client_max_body_size`), and by the app's own limits: 5 GiB per PUT and the bucket owner's free
+space. Raise the first three plus `fastcgi_read_timeout` and keep `GITS3_MAX_BODY` below them; gc
+writes a pack that knows no push limit, so repack large repositories locally before the first
+push. And cron has to run, or abandoned uploads are never reclaimed.
 
 **CAS is only as good as the ETag.** gits3 fences concurrent pushes by rewriting `packed-refs`
 with `If-Match`. That holds because this app computes ETags from content — Nextcloud's own etag
@@ -267,7 +277,12 @@ than enough for a compare-and-swap to accept a lost update.
 
 This app therefore computes S3 ETags from content: plain MD5 for single-part uploads, the compound
 `<md5-of-part-md5s>-<parts>` form for multipart. Objects written outside this API (web UI, WebDAV,
-sync client) get an ETag on first read.
+sync client) get an ETag on first read. A listing hashes at most 256 MiB of such files per page;
+the rest are listed with a placeholder until a later listing, `GET` or `HEAD` has computed theirs:
+Nextcloud's own etag with a `-0` suffix, which marks it as not an MD5 so tools do not compare it
+with the content. It is not the object's ETag either, so do not use one from a listing for
+`If-Match` — `HEAD` gives the real one. Without that cap, one listing of a folder full of large
+files could read terabytes.
 
 </details>
 
@@ -286,7 +301,16 @@ sync client) get an ETag on first read.
   in flight, excluded from listings. Uploads never completed or aborted are reclaimed after a week
   by a background job.
 * **Keys map to paths.** A key containing `/` creates folders, so `a/b` and `a` cannot both be
-  objects.
+  objects. Keys that cannot be a path as they stand are refused with `InvalidArgument`: empty,
+  `.` or `..` segments, a backslash, control characters, bytes that are not UTF-8, and Unicode
+  that is not in NFC (Nextcloud stores every name in NFC, so `e` + combining accent would be a
+  second name for `é`). Files whose names no key can spell are left out of listings.
+* **A bucket is its folder**, not the folder's path: rename or move the folder and the bucket
+  follows it. Moved to the trash, the bucket answers `NoSuchBucket` until it is restored.
+* **Limits.** 5 GiB per `PutObject` or `UploadPart`, as on S3, and never more than the free space
+  of the bucket owner (`403 AccessDenied` otherwise, before the body is read). XML bodies
+  (`DeleteObjects`, `CompleteMultipartUpload`) up to 4 MiB. At most 1000 multipart uploads in
+  flight per bucket. `ListParts` and `ListMultipartUploads` page like `ListObjects`.
 
 ---
 
@@ -297,11 +321,21 @@ sync client) get an ETag on first read.
 expired presigned URLs; `X-Amz-Expires` is capped at seven days, as on AWS. `host` and every
 `x-amz-*` header the request carries must be signed.
 
+The body is bound to the signature as far as the request allows: a literal `x-amz-content-sha256`
+is checked against it, and so are signed `aws-chunked` chunks. `DeleteObjects` additionally needs
+something the signature covers to pin its body down — a literal payload hash, a signed
+`Content-MD5`, or an `x-amz-checksum-*` header — as S3 requires a checksum there anyway; every SDK
+sends one.
+
 Each API key is bound to **exactly one bucket** and is either `readonly` or `readwrite`.
-`ListBuckets` reports only that bucket — not every bucket the owning account happens to have —
-and any other bucket name answers `NoSuchBucket`, whether the account has such a bucket or not.
-Keys stop working when their account is disabled and are removed when it is deleted. Wrong
-secrets and unknown keys count towards Nextcloud's brute force protection.
+`readonly` reads and lists objects; multipart uploads, including listing them and their parts,
+need `readwrite`. `ListBuckets` reports only that bucket — not every bucket the owning account
+happens to have — and any other bucket name answers `NoSuchBucket`, whether the account has such a
+bucket or not. Keys stop working when their account is disabled and are removed when it is
+deleted. Wrong secrets and unknown keys count towards Nextcloud's brute force protection and are
+logged as warnings with the access key they named. Creating and deleting buckets and keys, and
+every `DeleteObjects`, are logged at info level and to `admin_audit`'s audit log when that app is
+enabled.
 
 > **Use HTTPS.** As on AWS, a signature only proves who made the request. Within its 15 minutes
 > (or a presigned URL's lifetime) anyone who captured it can replay it, and the request and

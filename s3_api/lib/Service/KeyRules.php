@@ -49,14 +49,43 @@ final class KeyRules {
 	 * folder. Nextcloud reads a backslash as a path separator and drops NUL
 	 * bytes, so either makes the name stand for a different one. Filesystems
 	 * stop at 255 bytes, which Nextcloud reports as a permission problem.
+	 *
+	 * Nextcloud also normalises every path to Unicode NFC, so `é` spelled as
+	 * `e` plus a combining accent (NFD) names the same file as the composed
+	 * `é` — with a lock row of its own, and past the self-copy and bucket
+	 * overlap checks, which compare strings. Only the NFC spelling is a key.
+	 * Bytes that are not UTF-8 at all cannot be normalised and end up as a
+	 * database error, so they are refused as well.
+	 *
+	 * Control characters are refused because a key has to survive the XML it
+	 * is listed in: XML 1.0 cannot carry U+0000–U+001F (save tab, LF and CR,
+	 * and a parser rewrites CR to LF), nor U+FFFE/U+FFFF. A key holding one
+	 * would break the listing of its whole prefix for every client.
 	 */
 	public static function isPlainSegment(string $segment): bool {
 		return $segment !== ''
 			&& $segment !== '.'
 			&& $segment !== '..'
+			&& strlen($segment) <= self::MAX_NAME_BYTES
 			&& !str_contains($segment, '\\')
-			&& !str_contains($segment, "\0")
-			&& strlen($segment) <= self::MAX_NAME_BYTES;
+			&& mb_check_encoding($segment, 'UTF-8')
+			&& preg_match('/[\x00-\x1F\x7F\x{FFFE}\x{FFFF}]/u', $segment) === 0
+			&& self::isNfc($segment);
+	}
+
+	/**
+	 * Whether a string is in Unicode Normalization Form C, the form Nextcloud
+	 * stores names in.
+	 *
+	 * Nextcloud itself cannot run without intl; should the class be missing
+	 * anyway, nothing normalises and there is no second spelling to refuse.
+	 */
+	public static function isNfc(string $value): bool {
+		if (!class_exists(\Normalizer::class)) {
+			return true;
+		}
+
+		return \Normalizer::isNormalized($value, \Normalizer::FORM_C);
 	}
 
 	/**

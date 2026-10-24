@@ -12,6 +12,7 @@ use OCA\S3Api\Service\EtagService;
 use OCA\S3Api\Service\KeyRules;
 use OCA\S3Api\Service\MultipartService;
 use OCA\S3Api\Service\ObjectLockService;
+use OCA\S3Api\Service\PayloadIntegrity;
 use OCA\S3Api\Service\S3AuthException;
 use OCA\S3Api\Service\S3AuthService;
 use OCA\S3Api\Service\S3RequestBody;
@@ -25,14 +26,15 @@ use OCP\AppFramework\Http\Attribute\PublicPage;
 use OCP\AppFramework\Http\DataDisplayResponse;
 use OCP\AppFramework\Http\Response;
 use OCP\AppFramework\Http\StreamResponse;
+use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Files\File;
 use OCP\Files\Folder;
 use OCP\Files\ForbiddenException;
 use OCP\Files\InvalidPathException;
-use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
 use OCP\Files\NotPermittedException;
 use OCP\IRequest;
+use OCP\Log\Audit\CriticalActionPerformedEvent;
 use OCP\Lock\LockedException;
 use Psr\Log\LoggerInterface;
 
@@ -40,6 +42,28 @@ class S3Controller extends Controller {
 
 	/** S3's limit on the keys in one DeleteObjects request. */
 	private const MAX_DELETE_KEYS = 1000;
+
+	/** S3's limit on the parts of one multipart upload. */
+	private const MAX_COMPLETE_PARTS = 10000;
+
+	/**
+	 * Largest object one PUT, and largest part one UploadPart, may carry: 5
+	 * GiB, as on S3. Anything bigger goes up as a multipart upload. The body
+	 * passes through the temp directory before Nextcloud stores it, so
+	 * without a bound one request could fill that directory for the whole
+	 * instance, whatever the uploader's quota.
+	 */
+	private const MAX_OBJECT_BYTES = 5 * 1024 * 1024 * 1024;
+
+	/**
+	 * Largest XML body accepted, before parsing. A full DeleteObjects (1000
+	 * keys of up to 1024 bytes) or CompleteMultipartUpload (10000 parts)
+	 * stays well below it. The body is held in memory and parsed into a tree
+	 * several times its size, and post_max_size does not apply to a raw
+	 * `application/xml` body -- without this the web server's limit is the
+	 * only one.
+	 */
+	private const MAX_XML_BODY_BYTES = 4 * 1024 * 1024;
 
 	/**
 	 * Brute force protection bucket for failed credentials. Nextcloud delays
@@ -59,6 +83,16 @@ class S3Controller extends Controller {
 	 */
 	private ?ChunkSignatureVerifier $chunkVerifier = null;
 
+	/**
+	 * Lower-case names of the headers the request signed, and the access
+	 * key it authenticated with. Request state like $chunkVerifier.
+	 *
+	 * @var string[]
+	 */
+	private array $signedHeaders = [];
+
+	private string $accessKey = '';
+
 	public function __construct(
 		string $appName,
 		IRequest $request,
@@ -71,7 +105,7 @@ class S3Controller extends Controller {
 		private MultipartService $multipartService,
 		private ObjectLockService $objectLock,
 		private TempFiles $tempFiles,
-		private IRootFolder $rootFolder,
+		private IEventDispatcher $eventDispatcher,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct($appName, $request);
@@ -180,13 +214,31 @@ class S3Controller extends Controller {
 		} catch (S3AuthException $e) {
 			$response = $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
 			if (in_array($e->getS3Code(), self::THROTTLED_CODES, true)) {
-				$response->throttle();
+				// Wrong guesses are what an attack looks like, so they are
+				// logged where an admin sees them. The brute force metadata
+				// keeps the key too: the throttle itself is per address.
+				$this->logger->warning('S3 authentication failed', [
+					'app' => 's3_api',
+					'code' => $e->getS3Code(),
+					'accessKey' => $e->getAccessKey(),
+					'remoteAddress' => $this->request->getRemoteAddress(),
+				]);
+				$response->throttle(['accessKey' => $e->getAccessKey() ?? '']);
+			} else {
+				$this->logger->info('S3 request refused', [
+					'app' => 's3_api',
+					'code' => $e->getS3Code(),
+					'accessKey' => $e->getAccessKey(),
+					'remoteAddress' => $this->request->getRemoteAddress(),
+				]);
 			}
 			return $response;
 		}
 
 		// Set for this request only; the controller is instantiated per request.
 		$this->chunkVerifier = $auth['chunkVerifier'];
+		$this->signedHeaders = $auth['signedHeaders'];
+		$this->accessKey = $auth['accessKey'];
 
 		$userId = $auth['userId'];
 		$permission = $auth['permission'];
@@ -202,6 +254,9 @@ class S3Controller extends Controller {
 		}
 
 		$path = $this->requestedPath($path);
+		if ($path === null) {
+			return $this->errorResponse('InvalidURI', "Couldn't parse the specified URI", '/', Http::STATUS_BAD_REQUEST);
+		}
 		$slashPos = strpos($path, '/');
 		if ($slashPos === false) {
 			$bucketName = $path;
@@ -228,15 +283,10 @@ class S3Controller extends Controller {
 			return $this->errorResponse('NoSuchBucket', 'The specified bucket does not exist', '/' . $bucketName, Http::STATUS_NOT_FOUND);
 		}
 
-		$userFolder = $this->rootFolder->getUserFolder($userId);
-		try {
-			$bucketFolder = $userFolder->get($bucket->getFolderPath());
-		} catch (NotFoundException) {
+		// By the folder's file id, not its path: see BucketService.
+		$bucketFolder = $this->bucketService->resolveFolder($bucket);
+		if ($bucketFolder === null) {
 			return $this->errorResponse('NoSuchBucket', 'Bucket folder not found', '/' . $bucketName, Http::STATUS_NOT_FOUND);
-		}
-
-		if (!($bucketFolder instanceof Folder)) {
-			return $this->errorResponse('NoSuchBucket', 'Bucket path is not a folder', '/' . $bucketName, Http::STATUS_NOT_FOUND);
 		}
 
 		$query = $this->queryParams();
@@ -273,7 +323,7 @@ class S3Controller extends Controller {
 			}
 
 			return match (true) {
-				$known === 'uploads' && $method === 'GET' => $this->listMultipartUploads($bucket, $bucketName),
+				$known === 'uploads' && $method === 'GET' => $this->listMultipartUploads($bucket, $bucketName, $query, $permission),
 				$known === 'delete' && $method === 'POST' => $this->deleteObjects($bucketFolder, $bucketName, $permission),
 				$known === 'location' && $method === 'GET' => $this->xmlResponse($this->responseBuilder->locationXml()),
 				$known === 'versioning' && $method === 'GET' => $this->xmlResponse($this->responseBuilder->versioningXml()),
@@ -331,7 +381,7 @@ class S3Controller extends Controller {
 				$method === 'PUT' => $this->uploadPart($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $partNumber, $permission),
 				$method === 'POST' => $this->completeMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
 				$method === 'DELETE' => $this->abortMultipartUpload($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $permission),
-				$method === 'GET' => $this->listParts($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId),
+				$method === 'GET' => $this->listParts($bucket, $bucketFolder, $bucketName, $objectKey, $uploadId, $query, $permission),
 				default => $this->errorResponse('MethodNotAllowed', 'Method not allowed', $resource, Http::STATUS_METHOD_NOT_ALLOWED),
 			};
 		}
@@ -400,10 +450,17 @@ class S3Controller extends Controller {
 	 * endpoint is configured with a trailing slash sends `…/s3//bucket/…`, and
 	 * that names no key. The raw path is only used when collapsing it gives
 	 * back exactly what was routed, so the two can differ in collapsed slashes
-	 * and nothing else. A request URI of any other shape keeps the routed
-	 * path.
+	 * and nothing else.
+	 *
+	 * A request URI of any other shape is refused rather than served from the
+	 * routed path: that path is exactly the one that may have lost a slash,
+	 * so falling back to it would quietly bring the aliasing back the day a
+	 * Nextcloud release or a proxy rewrites URIs in some new way.
+	 *
+	 * @return string|null null when the request URI does not account for the
+	 *         routed path
 	 */
-	private function requestedPath(string $routed): string {
+	private function requestedPath(string $routed): ?string {
 		$uri = $this->request->getRequestUri();
 		$query = strpos($uri, '?');
 		if ($query !== false) {
@@ -411,13 +468,23 @@ class S3Controller extends Controller {
 		}
 
 		if (preg_match('#/apps/s3_api/s3/+(.+)$#', $uri, $match) !== 1) {
-			return $routed;
+			$this->logger->warning('S3 request URI does not match the routed path', [
+				'app' => 's3_api',
+				'uri' => $uri,
+				'routed' => $routed,
+			]);
+			return null;
 		}
 
 		// Nextcloud collapses first and decodes second; compare the same way,
 		// or an encoded slash next to a literal one would not round-trip.
 		if (rawurldecode((string)preg_replace('#/{2,}#', '/', $match[1])) !== $routed) {
-			return $routed;
+			$this->logger->warning('S3 request URI does not match the routed path', [
+				'app' => 's3_api',
+				'uri' => $uri,
+				'routed' => $routed,
+			]);
+			return null;
 		}
 
 		return rawurldecode($match[1]);
@@ -664,24 +731,27 @@ class S3Controller extends Controller {
 
 		// Read the body before taking the lock: the upload can take a while and
 		// nothing about it depends on the object's current state.
-		$sha256 = null;
 		try {
-			$stream = $this->requestBody->toStream($this->request, $sha256, null, $this->chunkVerifier);
+			$stream = $this->readUploadBody($bucketFolder);
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		}
 
 		try {
-			// Verify the payload hash when the client committed to a literal one.
-			$declaredHash = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
-			if ($declaredHash !== '' && ctype_xdigit($declaredHash) && strlen($declaredHash) === 64
-				&& !hash_equals($declaredHash, (string)$sha256)) {
-				return $this->errorResponse(
-					'XAmzContentSHA256Mismatch',
-					'The provided x-amz-content-sha256 does not match what was computed',
-					$resource,
-					Http::STATUS_BAD_REQUEST,
-				);
+			// Comparing against a stored ETag hashes the object first if it
+			// has none recorded -- a read of the whole file. Do that before
+			// taking the lock, so the lock is held for the lookup and the
+			// write, not for however long the hash takes; under the lock
+			// get() then finds the record, unless the file changed meanwhile.
+			if ($ifMatch !== '' || ($ifNoneMatch !== '' && $ifNoneMatch !== '*')) {
+				try {
+					$current = $bucketFolder->get($objectKey);
+					if ($current instanceof File) {
+						$this->etagService->get($current);
+					}
+				} catch (NotFoundException) {
+					// Nothing to compare against; the precondition decides.
+				}
 			}
 
 			$write = fn(): Response => $this->writeObject(
@@ -712,6 +782,103 @@ class S3Controller extends Controller {
 				fclose($stream);
 			}
 		}
+	}
+
+	/**
+	 * Read an upload body into a temp stream and check its payload hash.
+	 *
+	 * Bounded twice before the body reaches the temp directory: by what one
+	 * request may carry at all, and by the free space where it is going to
+	 * be stored. Nextcloud's quota only applies once the bytes are stored,
+	 * which is after they have all been written to the temp directory --
+	 * shared by every user of the instance.
+	 *
+	 * @return resource rewound, owned by the caller
+	 * @throws S3AuthException
+	 */
+	private function readUploadBody(Folder $target) {
+		$limit = self::MAX_OBJECT_BYTES;
+		$quotaBound = false;
+		try {
+			$free = $target->getFreeSpace();
+		} catch (\Throwable) {
+			$free = false;
+		}
+		// Negative values mean unknown or unlimited.
+		if ((is_int($free) || is_float($free)) && $free >= 0 && $free < $limit) {
+			$limit = (int)$free;
+			$quotaBound = true;
+		}
+
+		$sha256 = null;
+		try {
+			$stream = $this->requestBody->toStream($this->request, $sha256, null, $this->chunkVerifier, $limit);
+		} catch (S3AuthException $e) {
+			if ($e->getS3Code() === 'EntityTooLarge' && $quotaBound) {
+				// The same answer a full quota gets from Nextcloud itself.
+				throw new S3AuthException('AccessDenied', 'Not enough free space for this upload', Http::STATUS_FORBIDDEN);
+			}
+			throw $e;
+		}
+
+		// Verify the payload hash when the client committed to a literal one.
+		$declared = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
+		if (PayloadIntegrity::isLiteralSha256($declared) && !hash_equals($declared, (string)$sha256)) {
+			fclose($stream);
+			throw new S3AuthException(
+				'XAmzContentSHA256Mismatch',
+				'The provided x-amz-content-sha256 does not match what was computed',
+				Http::STATUS_BAD_REQUEST,
+			);
+		}
+
+		return $stream;
+	}
+
+	/**
+	 * Read and parse the XML body of DeleteObjects or CompleteMultipartUpload.
+	 *
+	 * Through S3RequestBody like an upload, so an `aws-chunked` body is
+	 * decoded and its chunk signatures checked, and bounded before anything
+	 * is parsed. Then every integrity claim the request makes about the body
+	 * is checked, see PayloadIntegrity. With `$mustBeBound`, as S3 requires
+	 * Content-MD5 or a checksum for DeleteObjects, one of them also has to
+	 * be covered by the signature: otherwise a captured request could be
+	 * replayed with another body, naming other keys to delete.
+	 *
+	 * @param bool $checksumsDescribeBody see PayloadIntegrity::verify()
+	 * @return \SimpleXMLElement|null null when the body is not acceptable XML
+	 * @throws S3AuthException
+	 */
+	private function readXmlBody(bool $mustBeBound, bool $checksumsDescribeBody): ?\SimpleXMLElement {
+		$sha256 = null;
+		try {
+			$body = $this->requestBody->toString($this->request, self::MAX_XML_BODY_BYTES, $this->chunkVerifier, $sha256);
+		} catch (S3AuthException $e) {
+			if ($e->getS3Code() === 'EntityTooLarge') {
+				throw new S3AuthException('MaxMessageLengthExceeded', 'Your request was too big', Http::STATUS_BAD_REQUEST);
+			}
+			throw $e;
+		}
+
+		$bound = PayloadIntegrity::verify(
+			$this->request,
+			$body,
+			(string)$sha256,
+			$this->signedHeaders,
+			$this->chunkVerifier !== null,
+			$checksumsDescribeBody,
+		);
+
+		if ($mustBeBound && !$bound) {
+			throw new S3AuthException(
+				'InvalidRequest',
+				'Missing required header for this request: Content-MD5 or x-amz-checksum-*, signed, or a literal x-amz-content-sha256',
+				Http::STATUS_BAD_REQUEST,
+			);
+		}
+
+		return $this->parseXmlBody($body);
 	}
 
 	/**
@@ -870,11 +1037,16 @@ class S3Controller extends Controller {
 			return $this->errorResponse('AccessDenied', 'Write access denied', '/' . $bucketName . '/' . $objectKey, Http::STATUS_FORBIDDEN);
 		}
 
-		$uploadId = $this->multipartService->create(
-			$bucket->getId(),
-			$bucket->getUserId(),
-			$objectKey,
-		);
+		try {
+			$uploadId = $this->multipartService->create(
+				$bucketFolder,
+				$bucket->getId(),
+				$bucket->getUserId(),
+				$objectKey,
+			);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $bucketName . '/' . $objectKey, $e->getHttpStatus());
+		}
 
 		return $this->xmlResponse(
 			$this->responseBuilder->initiateMultipartUploadXml($bucketName, $objectKey, $uploadId),
@@ -903,15 +1075,9 @@ class S3Controller extends Controller {
 		try {
 			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
 
-			$sha256 = null;
-			$stream = $this->requestBody->toStream($this->request, $sha256, null, $this->chunkVerifier);
-
-			$declared = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
-			if ($declared !== '' && ctype_xdigit($declared) && strlen($declared) === 64
-				&& !hash_equals($declared, (string)$sha256)) {
-				fclose($stream);
-				return $this->errorResponse('XAmzContentSHA256Mismatch', 'The provided x-amz-content-sha256 does not match what was computed', $resource, Http::STATUS_BAD_REQUEST);
-			}
+			// Parts are stored in the bucket's scratch area, so the bucket's
+			// free space is what bounds them.
+			$stream = $this->readUploadBody($bucketFolder);
 
 			try {
 				$etag = $this->multipartService->putPart($bucketFolder, $uploadId, (int)$partNumber, $stream);
@@ -948,7 +1114,9 @@ class S3Controller extends Controller {
 		try {
 			$upload = $this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
 
-			$requested = $this->parseCompleteBody(file_get_contents('php://input') ?: '');
+			// S3 does not require a checksum here, and SDKs do not all send
+			// one; whatever the request does claim about its body is checked.
+			$requested = $this->parseCompleteBody($this->readXmlBody(false, false));
 			if ($requested === null) {
 				return $this->errorResponse('MalformedXML', 'The XML you provided was not well-formed', $resource, Http::STATUS_BAD_REQUEST);
 			}
@@ -1002,14 +1170,32 @@ class S3Controller extends Controller {
 		return new DataDisplayResponse('', Http::STATUS_NO_CONTENT);
 	}
 
+	/**
+	 * ListParts, a page at a time (`max-parts`, `part-number-marker`).
+	 *
+	 * Needs a readwrite key, like every other multipart operation: uploads
+	 * in flight are the writers' business, and on S3 listing them is a
+	 * permission of its own that a read-only policy does not grant.
+	 *
+	 * @param array<string, string> $query
+	 */
 	private function listParts(
 		$bucket,
 		Folder $bucketFolder,
 		string $bucketName,
 		string $objectKey,
 		string $uploadId,
+		array $query,
+		string $permission,
 	): Response {
 		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Access Denied', $resource, Http::STATUS_FORBIDDEN);
+		}
+
+		$marker = $this->intParam($query, 'part-number-marker', 0);
+		$maxParts = $this->pageSize($query, 'max-parts');
 
 		try {
 			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
@@ -1018,16 +1204,59 @@ class S3Controller extends Controller {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		}
 
+		$parts = array_values(array_filter($parts, static fn(array $part): bool => $part['number'] > $marker));
+		$truncated = count($parts) > $maxParts;
+		$parts = array_slice($parts, 0, $maxParts);
+
 		return $this->xmlResponse(
-			$this->responseBuilder->listPartsXml($bucketName, $objectKey, $uploadId, $parts),
+			$this->responseBuilder->listPartsXml($bucketName, $objectKey, $uploadId, $parts, $marker, $maxParts, $truncated),
 		);
 	}
 
-	private function listMultipartUploads($bucket, string $bucketName): Response {
-		$uploads = $this->multipartService->listUploads($bucket->getId());
+	/**
+	 * ListMultipartUploads, a page at a time (`max-uploads`, `key-marker`,
+	 * `upload-id-marker`, `prefix`). Readwrite only, as ListParts.
+	 *
+	 * @param array<string, string> $query
+	 */
+	private function listMultipartUploads($bucket, string $bucketName, array $query, string $permission): Response {
+		if ($permission !== 'readwrite') {
+			return $this->errorResponse('AccessDenied', 'Access Denied', '/' . $bucketName, Http::STATUS_FORBIDDEN);
+		}
+
+		$prefix = $query['prefix'] ?? '';
+		$keyMarker = $query['key-marker'] ?? '';
+		// Without a key marker S3 ignores the upload id marker.
+		$uploadIdMarker = $keyMarker === '' ? '' : ($query['upload-id-marker'] ?? '');
+		$maxUploads = $this->pageSize($query, 'max-uploads');
+
+		$uploads = $this->multipartService->listUploads($bucket->getId(), $prefix, $keyMarker, $uploadIdMarker, $maxUploads);
+		$truncated = count($uploads) > $maxUploads;
+		$uploads = array_slice($uploads, 0, $maxUploads);
+
 		return $this->xmlResponse(
-			$this->responseBuilder->listMultipartUploadsXml($bucketName, $uploads),
+			$this->responseBuilder->listMultipartUploadsXml($bucketName, $uploads, $prefix, $keyMarker, $uploadIdMarker, $maxUploads, $truncated),
 		);
+	}
+
+	/**
+	 * A non-negative integer query parameter, or `$default`.
+	 *
+	 * @param array<string, string> $query
+	 */
+	private function intParam(array $query, string $name, int $default): int {
+		$raw = $query[$name] ?? '';
+		return ctype_digit($raw) && strlen($raw) < 10 ? (int)$raw : $default;
+	}
+
+	/**
+	 * A page size as S3 takes it: 1000 by default and at most.
+	 *
+	 * @param array<string, string> $query
+	 */
+	private function pageSize(array $query, string $name): int {
+		$size = $this->intParam($query, $name, 1000);
+		return $size < 1 ? 1000 : min($size, 1000);
 	}
 
 	/**
@@ -1070,12 +1299,13 @@ class S3Controller extends Controller {
 	/**
 	 * Parse the part list from a CompleteMultipartUpload body.
 	 *
+	 * @param \SimpleXMLElement|null $doc the parsed body, null if it did not
+	 *        parse
 	 * @return array<int, array{number: int, etag: string}>|null null when the
-	 *         XML cannot be parsed
+	 *         XML cannot be parsed or names more parts than an upload can have
 	 */
-	private function parseCompleteBody(string $xml): ?array {
-		$doc = $this->parseXmlBody($xml);
-		if ($doc === null) {
+	private function parseCompleteBody(?\SimpleXMLElement $doc): ?array {
+		if ($doc === null || count($doc->Part) > self::MAX_COMPLETE_PARTS) {
 			return null;
 		}
 
@@ -1172,7 +1402,7 @@ class S3Controller extends Controller {
 			return $this->errorResponse('NoSuchKey', 'The copy source is not a file', $resource, Http::STATUS_NOT_FOUND);
 		}
 
-		if ($sourceKey === $objectKey) {
+		if ($this->isSameFile($bucketFolder, $objectKey, $source)) {
 			// A self-copy would truncate the source before reading it.
 			return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($this->etagService->get($source), $source->getMTime()));
 		}
@@ -1191,6 +1421,24 @@ class S3Controller extends Controller {
 		}
 
 		return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($this->etagService->refresh($file), $file->getMTime()));
+	}
+
+	/**
+	 * Whether `$objectKey` names the file `$source` is.
+	 *
+	 * Decided by file id, not by comparing the keys: two spellings can reach
+	 * one file -- on a case-insensitive storage such as an SMB mount, `A` and
+	 * `a` do -- and a string comparison would let such a copy open the
+	 * source for reading and then truncate it for writing.
+	 */
+	private function isSameFile(Folder $bucketFolder, string $objectKey, File $source): bool {
+		try {
+			$target = $bucketFolder->get($objectKey);
+		} catch (NotFoundException) {
+			return false;
+		}
+
+		return $target->getId() === $source->getId();
 	}
 
 	/**
@@ -1381,7 +1629,11 @@ class S3Controller extends Controller {
 			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
 		}
 
-		$doc = $this->parseXmlBody(file_get_contents('php://input') ?: '');
+		try {
+			$doc = $this->readXmlBody(true, true);
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		}
 		if ($doc === null) {
 			return $this->errorResponse('MalformedXML', 'The XML you provided was not well-formed', $resource, Http::STATUS_BAD_REQUEST);
 		}
@@ -1430,6 +1682,26 @@ class S3Controller extends Controller {
 				$errors[] = ['key' => $key, 'code' => 'InternalError', 'message' => 'Could not delete the object'];
 			}
 		}
+
+		// One request can take a thousand objects with it, so it leaves a
+		// trace of its own beside the per-file entries Nextcloud's audit log
+		// writes anyway.
+		$this->logger->info('S3 DeleteObjects', [
+			'app' => 's3_api',
+			'bucket' => $bucketName,
+			'accessKey' => $this->accessKey,
+			'deleted' => count($deleted),
+			'errors' => count($errors),
+		]);
+		$this->eventDispatcher->dispatchTyped(new CriticalActionPerformedEvent(
+			'S3 DeleteObjects in bucket "%s" with access key "%s": %s deleted, %s failed',
+			[
+				'bucket' => $bucketName,
+				'accessKey' => $this->accessKey,
+				'deleted' => (string)count($deleted),
+				'errors' => (string)count($errors),
+			],
+		));
 
 		return $this->xmlResponse(
 			$this->responseBuilder->deleteResultXml($quiet ? [] : $deleted, $errors),

@@ -13,7 +13,9 @@ use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\Attribute\NoAdminRequired;
 use OCP\AppFramework\Http\JSONResponse;
 use OCP\DB\Exception as DbException;
+use OCP\EventDispatcher\IEventDispatcher;
 use OCP\IRequest;
+use OCP\Log\Audit\CriticalActionPerformedEvent;
 use Psr\Log\LoggerInterface;
 
 class SettingsApiController extends Controller {
@@ -23,15 +25,30 @@ class SettingsApiController extends Controller {
 		IRequest $request,
 		private BucketService $bucketService,
 		private ApiKeyService $apiKeyService,
+		private IEventDispatcher $eventDispatcher,
 		private LoggerInterface $logger,
 		private ?string $userId,
 	) {
 		parent::__construct($appName, $request);
 	}
 
+	/**
+	 * Record a change to buckets or keys: in nextcloud.log at info level, and
+	 * in admin_audit's audit.log when that app is enabled.
+	 *
+	 * @param array<string, string> $parameters filled into `$message` in order
+	 */
+	private function audit(string $message, array $parameters): void {
+		$this->logger->info(vsprintf($message, array_values($parameters)), [
+			'app' => 's3_api',
+			'userId' => $this->userId,
+		] + $parameters);
+		$this->eventDispatcher->dispatchTyped(new CriticalActionPerformedEvent($message, $parameters));
+	}
+
 	#[NoAdminRequired]
 	public function listBuckets(): JSONResponse {
-		$buckets = $this->bucketService->listBuckets($this->userId);
+		$buckets = $this->bucketService->listBucketsWithCurrentPaths($this->userId);
 		return new JSONResponse(array_map(fn($b) => $b->jsonSerialize(), $buckets));
 	}
 
@@ -40,12 +57,19 @@ class SettingsApiController extends Controller {
 		$folderPath = $this->request->getParam('folderPath', '');
 		$bucketName = $this->request->getParam('bucketName', '');
 
-		if (empty($folderPath) || empty($bucketName)) {
+		// JSON can carry any type here; the service takes strings, and a
+		// TypeError would end as a 500.
+		if (!is_string($folderPath) || !is_string($bucketName) || $folderPath === '' || $bucketName === '') {
 			return new JSONResponse(['error' => 'folderPath and bucketName are required'], Http::STATUS_BAD_REQUEST);
 		}
 
 		try {
 			$bucket = $this->bucketService->createBucket($this->userId, $folderPath, $bucketName);
+			$this->audit('S3 bucket "%s" created on folder "%s" by user "%s"', [
+				'bucket' => $bucket->getBucketName(),
+				'folder' => $bucket->getFolderPath(),
+				'user' => (string)$this->userId,
+			]);
 			return new JSONResponse($bucket->jsonSerialize(), Http::STATUS_CREATED);
 		} catch (\InvalidArgumentException $e) {
 			return new JSONResponse(['error' => $e->getMessage()], Http::STATUS_BAD_REQUEST);
@@ -76,7 +100,11 @@ class SettingsApiController extends Controller {
 	#[NoAdminRequired]
 	public function deleteBucket(int $id): JSONResponse {
 		try {
-			$this->bucketService->deleteBucket($id, $this->userId);
+			$bucket = $this->bucketService->deleteBucket($id, $this->userId);
+			$this->audit('S3 bucket "%s" and its keys deleted by user "%s"', [
+				'bucket' => $bucket->getBucketName(),
+				'user' => (string)$this->userId,
+			]);
 			return new JSONResponse(['status' => 'ok']);
 		} catch (DoesNotExistException) {
 			return new JSONResponse(['error' => 'Bucket not found'], Http::STATUS_NOT_FOUND);
@@ -98,18 +126,33 @@ class SettingsApiController extends Controller {
 	#[NoAdminRequired]
 	public function createKey(int $bucketId): JSONResponse {
 		$permission = $this->request->getParam('permission', 'readonly');
-		$label = $this->request->getParam('label', '');
+		$label = $this->request->getParam('label', '') ?? '';
+
+		if (!is_string($permission) || !is_string($label)) {
+			return new JSONResponse(['error' => 'permission and label must be strings'], Http::STATUS_BAD_REQUEST);
+		}
+		// The column holds 255 characters; longer used to be a database error.
+		if (mb_strlen($label) > 255) {
+			return new JSONResponse(['error' => 'Label must be at most 255 characters'], Http::STATUS_BAD_REQUEST);
+		}
 
 		try {
 			$result = $this->apiKeyService->createKey(
 				$this->userId,
 				$bucketId,
 				$permission,
-				$label ?: null,
+				$label !== '' ? $label : null,
 			);
 
 			$data = $result['key']->jsonSerialize();
 			$data['secretKey'] = $result['secretKey'];
+
+			$this->audit('S3 access key "%s" (%s) created for bucket %s by user "%s"', [
+				'accessKey' => $result['key']->getAccessKey(),
+				'permission' => $result['key']->getPermission(),
+				'bucketId' => (string)$bucketId,
+				'user' => (string)$this->userId,
+			]);
 
 			return new JSONResponse($data, Http::STATUS_CREATED);
 		} catch (\InvalidArgumentException $e) {
@@ -122,7 +165,12 @@ class SettingsApiController extends Controller {
 	#[NoAdminRequired]
 	public function deleteKey(int $bucketId, int $keyId): JSONResponse {
 		try {
-			$this->apiKeyService->deleteKey($keyId, $bucketId, $this->userId);
+			$key = $this->apiKeyService->deleteKey($keyId, $bucketId, $this->userId);
+			$this->audit('S3 access key "%s" of bucket %s deleted by user "%s"', [
+				'accessKey' => $key->getAccessKey(),
+				'bucketId' => (string)$bucketId,
+				'user' => (string)$this->userId,
+			]);
 			return new JSONResponse(['status' => 'ok']);
 		} catch (DoesNotExistException) {
 			return new JSONResponse(['error' => 'Key not found'], Http::STATUS_NOT_FOUND);

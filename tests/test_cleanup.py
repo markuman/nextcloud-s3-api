@@ -21,9 +21,12 @@ def run_cleanup(occ):
     return lambda: occ("background-job:execute", "--force-execute", str(jobs[0]["id"]))
 
 
-def lock_key(nc, env, key):
-    """ObjectLockService's row key for an object: a hash of its storage path."""
-    return hashlib.sha256(f"/{nc.user}/files/{env.main.folder}/{key}".encode()).hexdigest()
+def lock_key(sql, env, key):
+    """ObjectLockService's row key for an object: a hash of where its file is,
+    as the bucket folder's file cache row has it -- storage and path there."""
+    row = sql("SELECT f.storage, f.path FROM oc_filecache f JOIN oc_s3api_buckets b ON b.folder_id = f.fileid"
+              " WHERE b.id = ?", env.main.id)[0]
+    return hashlib.sha256(f"{row['storage']}:{row['path']}/{key}".encode()).hexdigest()
 
 
 def test_cleanup_job(boto, s3, nc, env, sql, run_cleanup, bucket, prefix):
@@ -79,7 +82,7 @@ def test_stale_lock_is_broken(s3, nc, env, sql, bucket, prefix):
     """A lock whose request died does not wedge the key: once it is older than
     fifteen minutes, the next conditional write breaks it."""
     key = prefix + "obj"
-    lk = lock_key(nc, env, key)
+    lk = lock_key(sql, env, key)
     sql("INSERT INTO oc_s3api_locks (lock_key, acquired_at) VALUES (?, ?)", lk, int(time.time()) - 1000)
 
     started = time.monotonic()
@@ -95,15 +98,16 @@ def test_held_lock_holds_off_conditional_writes(s3, nc, env, sql, bucket, prefix
     """Five minutes old is not stale: a big write to slow storage can hold the
     lock that long, and breaking it would let a second writer in."""
     key = prefix + "obj"
-    lk = lock_key(nc, env, key)
+    lk = lock_key(sql, env, key)
     sql("INSERT INTO oc_s3api_locks (lock_key, acquired_at) VALUES (?, ?)", lk, int(time.time()) - 300)
     try:
         started = time.monotonic()
         r = s3.put(bucket, key, b"x", headers={"If-None-Match": "*"})
-        # Waits for the lock for ten seconds, then gives up retryably.
+        # Waits for the lock for a few seconds, then gives up retryably --
+        # not so long that waiting writers tie up the PHP workers.
         assert r.status == 503
         assert r.error_code == "SlowDown"
-        assert time.monotonic() - started >= 9
+        assert 2.5 <= time.monotonic() - started < 8
         assert s3.get(bucket, key).status == 404
 
         # Only conditional writes take the lock.
