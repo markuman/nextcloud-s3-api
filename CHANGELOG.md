@@ -3,6 +3,39 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
+## 1.7.0 – 2026-10-25
+
+### Added
+- **A folder picker in the personal settings.** The folder path field has a *Choose…* button next
+  to it that opens Nextcloud's file picker, restricted to folders: navigate into a folder and
+  choose it. The home folder itself is not taken from the picker — a bucket on the whole home
+  blocks every other one — so that one has to be typed as `/`. Typing a path by hand still works,
+  and a path that does not exist is refused as before.
+- **`occ s3api:bucket:create`** pre-provisions bucket configs, for one or more users or for every
+  member of a group, so an admin can roll the app out without each user clicking through the
+  settings:
+  ```bash
+  occ s3api:bucket:create --user alice --folder /S3 --name files --create-folder
+  occ s3api:bucket:create --group staff --folder /S3 --name files --create-folder
+  ```
+  `--create-folder` creates the folder in each user's home when it is missing; without it a
+  missing folder is an error. No API keys are created — the users create their own on the bucket
+  that then shows up in their settings.
+  - Re-running is safe: a user whose bucket of that name already serves that folder is skipped.
+    Any other clash — the name on a different folder (also after the user renamed the folder),
+    or a folder inside or around another bucket — is an error for that user, and nothing is
+    created for them, not even the folder.
+  - An unknown user or group aborts the run before anything is created for anyone, and so does
+    `--folder /`: a bucket on the whole home blocks every other bucket of that user, which for a
+    group is a typo rather than a plan. Users who want it register it in their settings.
+  - An incoming share at the path, or above it, is refused: whoever shares a folder named like
+    the one picked for a group would otherwise receive everything its members upload.
+    `--allow-shared` accepts it when that is the point.
+  - A group covers its members at the time the command runs, so users who join later need
+    another run. The exit code is non-zero when any user could not be provisioned.
+
+  Bucket configs created this way are logged like the ones from the settings page.
+
 ## 1.6.2 – 2026-10-24
 
 **Hardening release.** No new features: this works through a security review of 1.6.1 — no

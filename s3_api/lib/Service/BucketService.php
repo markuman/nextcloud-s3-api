@@ -60,7 +60,21 @@ class BucketService {
 
 	public function createBucket(string $userId, string $folderPath, string $bucketName): Bucket {
 		$this->validateBucketName($bucketName);
-		$folder = $this->existingFolder($userId, $folderPath);
+		return $this->createBucketOnFolder($userId, $this->existingFolder($userId, $folderPath), $bucketName);
+	}
+
+	/**
+	 * createBucket() for a folder already resolved in the user's home -- the
+	 * occ command walks the path itself, since it may create it.
+	 *
+	 * The conflict checks run again here even if the caller already ran them
+	 * (the occ command does, before creating the folder): this is the last
+	 * point before the insert, and cheap compared to a wrong bucket.
+	 *
+	 * @throws BucketConflictException
+	 */
+	public function createBucketOnFolder(string $userId, Folder $folder, string $bucketName): Bucket {
+		$this->validateBucketName($bucketName);
 		$this->validateNameIsFree($userId, $bucketName);
 
 		$path = $this->relativePath($userId, $folder);
@@ -180,13 +194,7 @@ class BucketService {
 	 * taken; such a bucket has to be registered again.
 	 */
 	private function mayBindLegacy(Bucket $bucket, Folder $node): bool {
-		$storage = $node->getStorage();
-		// Two interfaces, and both are needed: internal shares implement the
-		// public one, federated shares only the files_sharing marker. A
-		// string, so nothing breaks with files_sharing disabled.
-		$isShare = $storage->instanceOfStorage(ISharedStorage::class)
-			|| $storage->instanceOfStorage('OCA\\Files_Sharing\\ISharedStorage');
-		if (!$isShare) {
+		if (!self::isShared($node)) {
 			return true;
 		}
 
@@ -196,6 +204,19 @@ class BucketService {
 		return $sharedAt instanceof \DateTimeInterface
 			&& $createdAt instanceof \DateTimeInterface
 			&& $sharedAt < $createdAt;
+	}
+
+	/**
+	 * Whether a folder is, or lies inside, an incoming share -- something
+	 * another user put into this home, under a name of their choosing.
+	 */
+	public static function isShared(Folder $node): bool {
+		$storage = $node->getStorage();
+		// Two interfaces, and both are needed: internal shares implement the
+		// public one, federated shares only the files_sharing marker. A
+		// string, so nothing breaks with files_sharing disabled.
+		return $storage->instanceOfStorage(ISharedStorage::class)
+			|| $storage->instanceOfStorage('OCA\\Files_Sharing\\ISharedStorage');
 	}
 
 	/**
@@ -260,10 +281,13 @@ class BucketService {
 	 * they were registered: a bucket's folder may have been renamed since,
 	 * and its old path then says nothing about what it contains.
 	 *
-	 * @param string $path the new folder, as Nextcloud spells it
+	 * Public for the occ command, which checks before it creates a folder that
+	 * would then go unused.
+	 *
+	 * @param string $path the new folder, relative to the home; normalised here
 	 * @throws BucketConflictException
 	 */
-	private function validateFolderNotAlreadyBucket(string $userId, string $path): void {
+	public function validateFolderNotAlreadyBucket(string $userId, string $path): void {
 		$needle = self::normalizePath($path);
 
 		foreach ($this->listBuckets($userId) as $other) {
@@ -319,7 +343,7 @@ class BucketService {
 	 * Nextcloud would resolve them to, and so does an NFD spelling, since
 	 * Nextcloud normalises every path to NFC.
 	 */
-	private static function normalizePath(string $path): string {
+	public static function normalizePath(string $path): string {
 		if (class_exists(\Normalizer::class)) {
 			$path = \Normalizer::normalize($path, \Normalizer::FORM_C) ?: $path;
 		}
@@ -339,7 +363,11 @@ class BucketService {
 		return '/' . implode('/', $segments);
 	}
 
-	private function validateBucketName(string $name): void {
+	/**
+	 * Public for the occ command, which validates the name once before it
+	 * creates anything for anyone.
+	 */
+	public function validateBucketName(string $name): void {
 		if (strlen($name) < 3 || strlen($name) > 63) {
 			throw new \InvalidArgumentException('Bucket name must be between 3 and 63 characters');
 		}
@@ -367,7 +395,7 @@ class BucketService {
 	 * A folder's path relative to the user's home, as Nextcloud spells it:
 	 * `/` for the home itself, `/Documents/sub` below it.
 	 */
-	private function relativePath(string $userId, Folder $folder): string {
+	public function relativePath(string $userId, Folder $folder): string {
 		$path = $this->rootFolder->getUserFolder($userId)->getRelativePath($folder->getPath());
 		return $path === null || $path === '' ? '/' : $path;
 	}

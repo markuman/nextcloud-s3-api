@@ -243,6 +243,45 @@
 				});
 		}
 
+		// ---- folder picker ----------------------------------------------
+
+		// OC.dialogs.filepicker is core's legacy wrapper around the Vue file
+		// picker, shipped on every page (33-36); using @nextcloud/dialogs
+		// directly would need a build step this app does not have. With the
+		// directory mimetype it lists only folders and allows picking them;
+		// with nothing selected, "Choose" takes the folder you navigated
+		// into. The callback gets the path relative to the user's files
+		// root, e.g. /Documents/shared.
+		//
+		// The home itself comes back as "/". Clicking Choose right away
+		// lands there, and a bucket on the whole home would block every
+		// other one, so that is left to typing "/" deliberately.
+		document
+			.getElementById('s3api-choose-folder')
+			.addEventListener('click', function () {
+				if (!window.OC || !OC.dialogs || typeof OC.dialogs.filepicker !== 'function') {
+					notify(t(APP, 'The folder picker is not available, please type the path.'));
+					return;
+				}
+				OC.dialogs.filepicker(
+					t(APP, 'Choose a folder'),
+					function (path) {
+						if (!path) {
+							return;
+						}
+						if (path === '/') {
+							notify(t(APP, 'That is your whole home folder. Open a folder and choose it, or type / to really register the whole home.'));
+							return;
+						}
+						document.getElementById('s3api-folder-path').value = path;
+					},
+					false,
+					'httpd/unix-directory',
+					true,
+					OC.dialogs.FILEPICKER_TYPE_CHOOSE
+				);
+			});
+
 		// ---- add bucket ------------------------------------------------
 
 		document

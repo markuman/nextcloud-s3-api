@@ -21,6 +21,7 @@ Util::addScript('s3_api', 'personal');
 
 	<div id="s3api-add-bucket" style="margin-top: 12px;">
 		<input type="text" id="s3api-folder-path" placeholder="<?php p($l->t('Folder path (e.g. Documents/shared)')); ?>" style="width: 250px;" />
+		<button type="button" id="s3api-choose-folder" title="<?php p($l->t('Pick an existing folder')); ?>"><?php p($l->t('Choose…')); ?></button>
 		<input type="text" id="s3api-bucket-name" placeholder="<?php p($l->t('Bucket name (e.g. my-docs)')); ?>" style="width: 200px;" />
 		<button id="s3api-add-bucket-btn" class="primary"><?php p($l->t('Add Bucket')); ?></button>
 	</div>

@@ -89,6 +89,22 @@ sudo -u www-data php occ app:enable s3_api
 Then in Nextcloud: **Settings → Personal → S3 API** → register a folder as a bucket → create an
 API key. Note down both keys; the secret is shown once.
 
+To roll the app out to many users at once, an admin can pre-create the bucket configs (and, with
+`--create-folder`, the folders) from the command line. No API keys are created — each user adds
+their own on the bucket that then shows up in their settings:
+
+```bash
+occ s3api:bucket:create --user alice --folder /S3 --name files --create-folder
+occ s3api:bucket:create --group staff --folder /S3 --name files --create-folder   # every member
+```
+
+A group covers its members at the time the command runs. Re-running it skips users whose bucket
+already serves that folder; any other clash (same name on another folder, overlapping buckets) is
+reported per user and nothing is created for them. An incoming share at the path is refused
+unless `--allow-shared` is given, and `--folder /` (the whole home) is always refused. Avoid a folder name the skeleton files also use (e.g.
+`/Documents`): for users who have never logged in, the skeleton is copied on their first login, into
+the bucket's folder if it has the same name.
+
 <details>
 <summary><b>Requirements and update notes</b></summary>
 
