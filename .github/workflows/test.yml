@@ -1,0 +1,56 @@
+# php syntax on the oldest and newest PHP, then the integration suite
+# (tests/run.sh) against every Nextcloud major the app declares, 36 being the
+# daily master build. Also runs weekly, so a new image or a broken daily shows
+# up without a push. Master may fail without failing the whole run.
+name: test
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: php -l ${{ matrix.php }}
+    runs-on: ubuntu-24.04
+    container: docker.io/library/php:${{ matrix.php }}-cli
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.2", "8.5"]
+    steps:
+      - uses: actions/checkout@v7
+      - name: lint
+        run: find s3_api -name '*.php' -print0 | xargs -0 -n1 php -l
+
+  integration:
+    name: nextcloud ${{ matrix.nc }}
+    needs: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.nc == 'master' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        nc: ["33", "34", "35", "master"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: checkout gits3srv
+        uses: actions/checkout@v7
+        with:
+          repository: markuman/gits3srv
+          path: gits3srv
+
+      - uses: astral-sh/setup-uv@v10
+
+      - name: tests/run.sh
+        env:
+          NC_VERSION: ${{ matrix.nc }}
+          GITS3: ${{ github.workspace }}/gits3srv/gits3.py
+        run: tests/run.sh
