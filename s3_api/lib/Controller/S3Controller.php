@@ -6,6 +6,7 @@ namespace OCA\S3Api\Controller;
 
 use OCA\S3Api\Db\BucketMapper;
 use OCA\S3Api\Http\S3ObjectResponse;
+use OCA\S3Api\Service\BodyHash;
 use OCA\S3Api\Service\BucketService;
 use OCA\S3Api\Service\ChunkSignatureVerifier;
 use OCA\S3Api\Service\EtagService;
@@ -212,27 +213,18 @@ class S3Controller extends Controller {
 		try {
 			$auth = $this->authService->authenticate($this->request);
 		} catch (S3AuthException $e) {
-			$response = $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
-			if (in_array($e->getS3Code(), self::THROTTLED_CODES, true)) {
-				// Wrong guesses are what an attack looks like, so they are
-				// logged where an admin sees them. The brute force metadata
-				// keeps the key too: the throttle itself is per address.
-				$this->logger->warning('S3 authentication failed', [
-					'app' => 's3_api',
-					'code' => $e->getS3Code(),
-					'accessKey' => $e->getAccessKey(),
-					'remoteAddress' => $this->request->getRemoteAddress(),
-				]);
-				$response->throttle(['accessKey' => $e->getAccessKey() ?? '']);
-			} else {
+			// For the log and the throttle in errorResponse(), which handles
+			// wrong guesses.
+			$this->accessKey = $e->getAccessKey() ?? '';
+			if (!in_array($e->getS3Code(), self::THROTTLED_CODES, true)) {
 				$this->logger->info('S3 request refused', [
 					'app' => 's3_api',
 					'code' => $e->getS3Code(),
-					'accessKey' => $e->getAccessKey(),
+					'accessKey' => $this->accessKey,
 					'remoteAddress' => $this->request->getRemoteAddress(),
 				]);
 			}
-			return $response;
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
 		}
 
 		// Set for this request only; the controller is instantiated per request.
@@ -785,7 +777,11 @@ class S3Controller extends Controller {
 	}
 
 	/**
-	 * Read an upload body into a temp stream and check its payload hash.
+	 * Read an upload body into a temp stream and check every integrity claim
+	 * the request makes about it: a literal payload hash, `Content-MD5`,
+	 * `x-amz-checksum-*` as header or trailer (see PayloadIntegrity). S3
+	 * answers a mismatch with BadDigest, and clients rely on that: a checksum
+	 * they signed is all that ties an `UNSIGNED-PAYLOAD` body to the request.
 	 *
 	 * Bounded twice before the body reaches the temp directory: by what one
 	 * request may carry at all, and by the free space where it is going to
@@ -810,9 +806,10 @@ class S3Controller extends Controller {
 			$quotaBound = true;
 		}
 
-		$sha256 = null;
+		$hash = new BodyHash(PayloadIntegrity::algorithms($this->request, true));
+		$trailers = [];
 		try {
-			$stream = $this->requestBody->toStream($this->request, $sha256, null, $this->chunkVerifier, $limit);
+			$stream = $this->requestBody->toStream($this->request, $hash, $this->chunkVerifier, $limit, $trailers);
 		} catch (S3AuthException $e) {
 			if ($e->getS3Code() === 'EntityTooLarge' && $quotaBound) {
 				// The same answer a full quota gets from Nextcloud itself.
@@ -821,15 +818,20 @@ class S3Controller extends Controller {
 			throw $e;
 		}
 
-		// Verify the payload hash when the client committed to a literal one.
-		$declared = strtolower(trim((string)$this->request->getHeader('x-amz-content-sha256')));
-		if (PayloadIntegrity::isLiteralSha256($declared) && !hash_equals($declared, (string)$sha256)) {
-			fclose($stream);
-			throw new S3AuthException(
-				'XAmzContentSHA256Mismatch',
-				'The provided x-amz-content-sha256 does not match what was computed',
-				Http::STATUS_BAD_REQUEST,
+		try {
+			// Unlike DeleteObjects, S3 does not require any of these on an
+			// upload, so whether one binds the body does not matter here.
+			PayloadIntegrity::verify(
+				$this->request,
+				$hash->digests(),
+				$trailers,
+				$this->signedHeaders,
+				$this->chunkVerifier !== null,
+				true,
 			);
+		} catch (S3AuthException $e) {
+			fclose($stream);
+			throw $e;
 		}
 
 		return $stream;
@@ -851,9 +853,10 @@ class S3Controller extends Controller {
 	 * @throws S3AuthException
 	 */
 	private function readXmlBody(bool $mustBeBound, bool $checksumsDescribeBody): ?\SimpleXMLElement {
-		$sha256 = null;
+		$hash = new BodyHash(PayloadIntegrity::algorithms($this->request, $checksumsDescribeBody));
+		$trailers = [];
 		try {
-			$body = $this->requestBody->toString($this->request, self::MAX_XML_BODY_BYTES, $this->chunkVerifier, $sha256);
+			$body = $this->requestBody->toString($this->request, self::MAX_XML_BODY_BYTES, $this->chunkVerifier, $hash, $trailers);
 		} catch (S3AuthException $e) {
 			if ($e->getS3Code() === 'EntityTooLarge') {
 				throw new S3AuthException('MaxMessageLengthExceeded', 'Your request was too big', Http::STATUS_BAD_REQUEST);
@@ -863,8 +866,8 @@ class S3Controller extends Controller {
 
 		$bound = PayloadIntegrity::verify(
 			$this->request,
-			$body,
-			(string)$sha256,
+			$hash->digests(),
+			$trailers,
 			$this->signedHeaders,
 			$this->chunkVerifier !== null,
 			$checksumsDescribeBody,
@@ -1743,17 +1746,35 @@ class S3Controller extends Controller {
 	}
 
 	/**
+	 * An S3 error response; throttled when it answers a wrong guess.
+	 *
+	 * A wrong key or signature is what an attack looks like, whether in the
+	 * request's signature or in one of its chunks', which only fails once
+	 * the handler reads the body. Throttling here catches both. They are
+	 * logged where an admin sees them, and the brute force metadata keeps
+	 * the key too: the throttle itself is per address.
+	 *
 	 * @param bool $withBody false to omit the XML body, which a response to
 	 *        HEAD must do
 	 */
 	private function errorResponse(string $code, string $message, string $resource, int $httpStatus, bool $withBody = true): Response {
-		if (!$withBody) {
+		if ($withBody) {
+			$response = $this->xmlResponse($this->responseBuilder->errorXml($code, $message, $resource), $httpStatus);
+		} else {
 			$response = new DataDisplayResponse('', $httpStatus);
 			$response->addHeader('Content-Type', 'application/xml');
-			return $response;
 		}
 
-		$xml = $this->responseBuilder->errorXml($code, $message, $resource);
-		return $this->xmlResponse($xml, $httpStatus);
+		if (in_array($code, self::THROTTLED_CODES, true)) {
+			$this->logger->warning('S3 authentication failed', [
+				'app' => 's3_api',
+				'code' => $code,
+				'accessKey' => $this->accessKey,
+				'remoteAddress' => $this->request->getRemoteAddress(),
+			]);
+			$response->throttle(['accessKey' => $this->accessKey]);
+		}
+
+		return $response;
 	}
 }

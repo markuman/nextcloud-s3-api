@@ -22,11 +22,10 @@ use OCP\Migration\SimpleMigrationStep;
  * instead.
  *
  * Existing buckets are bound to what their path names now, by the same rule
- * as on first use (BucketService::mayBindLegacy()): a share that appeared
- * after the bucket was registered is not taken, since that is exactly what
- * the attack looks like. A bucket whose folder cannot be found, or is such a
- * share, keeps a null id and a warning; BucketService tries again on first
- * use.
+ * as on first use (BucketService::bindLegacyBucket()): an incoming share is
+ * not taken, since a share mounted under the old name is exactly what the
+ * attack looks like. A bucket whose folder cannot be found, or is a share,
+ * keeps a null id and a warning; BucketService tries again on first use.
  */
 class Version1006002Date20261024000000 extends SimpleMigrationStep {
 
@@ -65,8 +64,8 @@ class Version1006002Date20261024000000 extends SimpleMigrationStep {
 
 			if ($folder === null) {
 				$output->warning('S3 bucket "' . $bucket->getBucketName() . '" of ' . $bucket->getUserId()
-					. ': folder ' . $bucket->getFolderPath() . ' not found or a share newer than the bucket;'
-					. ' not bound, will retry on first use');
+					. ': folder ' . $bucket->getFolderPath() . ' not found or an incoming share; not bound.'
+					. ' A missing folder is retried on first use, a share has to be registered again');
 			}
 		}
 	}

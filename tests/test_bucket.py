@@ -1,6 +1,5 @@
 """Service and bucket level operations, subresources and error shape."""
 import secrets
-import time
 import urllib.parse
 
 import pytest
@@ -165,7 +164,6 @@ def test_legacy_bucket_is_not_bound_to_a_newer_share(nc, nc_bob, sql, own_bucket
     mounted under the old name since. Binding by path would make it stick."""
     folder, b, client = own_bucket
     move(nc, folder, folder + "-renamed")
-    time.sleep(1.1)  # share times have second resolution
     nc_bob.mkcol(folder)
     nc_bob.upload(f"{folder}/obj", b"bob's")
     share_id, target = share_with(nc_bob, folder, nc)
@@ -182,24 +180,28 @@ def test_legacy_bucket_is_not_bound_to_a_newer_share(nc, nc_bob, sql, own_bucket
         nc_bob.remove(folder)
 
 
-def test_legacy_bucket_on_a_share_is_bound(nc, nc_bob, sql, env):
-    """A bucket registered on a share that was already there is the normal
-    case, and binds as before."""
+def test_legacy_bucket_on_a_share_is_not_bound(nc, nc_bob, sql, env):
+    """Not even on a share older than the bucket: a group share from before
+    the bucket only appears at the path when its recipient joins the group,
+    which may be after the bucket's folder was renamed away. A share's age
+    says nothing about when it was mounted, so a share is never bound by its
+    path."""
     from s3client import S3Client
     folder = f"s3t-{env.run_id}-shared-{secrets.token_hex(2)}"
     nc_bob.mkcol(folder)
     nc_bob.upload(f"{folder}/obj", b"shared")
     share_id, target = share_with(nc_bob, folder, nc)
     try:
-        time.sleep(1.1)
         b = nc.create_bucket("/" + target, f"sh-{secrets.token_hex(3)}")
         k = nc.create_key(b["id"])
         client = S3Client(env.endpoint, k["accessKey"], k["secretKey"])
+        assert client.get(b["bucketName"], "obj").body == b"shared"
         sql("UPDATE oc_s3api_buckets SET folder_id = NULL WHERE id = ?", b["id"])
 
-        assert client.get(b["bucketName"], "obj").body == b"shared"
-        (row,) = sql("SELECT folder_id FROM oc_s3api_buckets WHERE id = ?", b["id"])
-        assert row["folder_id"] is not None
+        r = client.get(b["bucketName"], "obj")
+        assert r.status == 404
+        assert r.error_code == "NoSuchBucket"
+        assert sql("SELECT folder_id FROM oc_s3api_buckets WHERE id = ?", b["id"]) == [{"folder_id": None}]
     finally:
         unshare(nc_bob, share_id)
         nc_bob.remove(folder)

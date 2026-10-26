@@ -185,22 +185,32 @@ class S3Client:
 
     # -- aws-chunked --------------------------------------------------------
 
-    def put_chunked_signed(self, bucket, key, chunks, *, tamper=None, drop_final=False, headers=None):
+    def put_chunked_signed(self, bucket, key, chunks, *, tamper=None, drop_final=False, headers=None,
+                           trailer=None):
         """PutObject with `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`.
 
         `tamper(index, data) -> data` replaces a chunk's bytes after it has
         been signed; `drop_final` omits the terminating zero-length chunk.
+
+        `trailer=(name, value)` switches to the `-TRAILER` variant: the
+        trailer is announced in `x-amz-trailer` and sent after the final
+        chunk, followed by an `x-amz-trailer-signature` line. That signature
+        is a dummy -- the server does not check it, the checksum is checked
+        against the bytes instead.
         """
-        payload_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        payload_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" + ("-TRAILER" if trailer else "")
         amz_date = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
         uri = self.uri(bucket, key)
         decoded = sum(len(c) for c in chunks)
 
         h = {"Host": self.host, "x-amz-date": amz_date, "x-amz-content-sha256": payload_hash,
              "Content-Encoding": "aws-chunked", "x-amz-decoded-content-length": str(decoded)}
-        h.update(headers or {})
         signed = ["content-encoding", "host", "x-amz-content-sha256", "x-amz-date",
                   "x-amz-decoded-content-length"]
+        if trailer:
+            h["x-amz-trailer"] = trailer[0]
+            signed.append("x-amz-trailer")
+        h.update(headers or {})
         h["Authorization"], seed = self.sign("PUT", uri, "", h, payload_hash, amz_date, signed=signed)
 
         scope = f"{amz_date[:8]}/{self.region}/s3/aws4_request"
@@ -215,25 +225,32 @@ class S3Client:
             prev = sig
             sent = tamper(i, data) if tamper else data
             body += f"{len(sent):x};chunk-signature={sig}\r\n".encode() + sent + b"\r\n"
+        if trailer and not drop_final:
+            # The final chunk is its header line plus the empty line that
+            # ends the body; the trailers go in between.
+            body = body[:-2] + f"{trailer[0]}:{trailer[1]}\r\nx-amz-trailer-signature:{'0' * 64}\r\n\r\n".encode()
         return self.send("PUT", uri, body, h)
 
-    def put_chunked_unsigned(self, bucket, key, chunks, trailer=None, decoded=None, final=True):
+    def put_chunked_unsigned(self, bucket, key, chunks, trailer=None, decoded=None, final=True, announce=True,
+                             headers=None):
         """PutObject with `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, the framing the
         current AWS SDKs default to. `decoded` overrides the declared length,
-        `final=False` leaves out the terminating zero-length chunk."""
+        `final=False` leaves out the terminating zero-length chunk,
+        `announce=False` sends the trailer without naming it in `x-amz-trailer`,
+        `headers` are added (and signed) as they are."""
         payload_hash = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
         if decoded is None:
             decoded = sum(len(c) for c in chunks)
         body = b"".join(f"{len(c):x}\r\n".encode() + c + b"\r\n" for c in chunks)
-        if not final:
-            return self.request("PUT", bucket, key, body, payload_hash=payload_hash,
-                                headers={"Content-Encoding": "aws-chunked",
-                                         "x-amz-decoded-content-length": str(decoded)})
-        body += b"0\r\n"
+        extra = headers or {}
         headers = {"Content-Encoding": "aws-chunked", "x-amz-decoded-content-length": str(decoded)}
+        if not final:
+            return self.request("PUT", bucket, key, body, payload_hash=payload_hash, headers={**headers, **extra})
+        body += b"0\r\n"
         if trailer:
             name, value = trailer
-            headers["x-amz-trailer"] = name
+            if announce:
+                headers["x-amz-trailer"] = name
             body += f"{name}:{value}\r\n".encode()
         body += b"\r\n"
-        return self.request("PUT", bucket, key, body, headers=headers, payload_hash=payload_hash)
+        return self.request("PUT", bucket, key, body, headers={**headers, **extra}, payload_hash=payload_hash)

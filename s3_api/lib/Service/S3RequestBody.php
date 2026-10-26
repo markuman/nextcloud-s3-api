@@ -34,6 +34,14 @@ use OCP\IRequest;
  *   binds the body to the credential: the payload hash in the canonical request
  *   is a sentinel here, so without that check the bytes are unauthenticated.
  *
+ * The SigV4a variants (`STREAMING-AWS4-ECDSA-P256-SHA256-*`) are refused by
+ * the auth service before a body is read: their chunk signatures could not be
+ * checked here, and decoding them unchecked would quietly treat a body its
+ * sender meant to be signed as unsigned.
+ *
+ * Trailers after the final chunk are collected for PayloadIntegrity, which
+ * checks the checksums among them against the decoded bytes.
+ *
  * Everything is streamed, so a multi-gigabyte upload never has to fit in
  * memory.
  */
@@ -53,6 +61,9 @@ class S3RequestBody {
 	/** Longest plausible chunk header line, including any chunk-signature. */
 	private const MAX_HEADER_LINE = 8192;
 
+	/** More trailers than any SDK sends: a checksum and its signature. */
+	private const MAX_TRAILERS = 8;
+
 	/**
 	 * Payload hash values that indicate an `aws-chunked` body.
 	 */
@@ -60,8 +71,6 @@ class S3RequestBody {
 		'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
 		'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
 		'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
-		'STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD',
-		'STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER',
 	];
 
 	/**
@@ -105,10 +114,9 @@ class S3RequestBody {
 	 * `aws-chunked` framing when present.
 	 *
 	 * The returned stream is rewound and owned by the caller, which must
-	 * fclose() it. `$sha256` receives the hash of the *decoded* content so a
-	 * caller can verify `x-amz-content-sha256` when it is a literal hash.
+	 * fclose() it. `$hash` is fed the *decoded* content, so the caller can
+	 * check what the request claims about it (PayloadIntegrity).
 	 *
-	 * @param resource|null $input Body handle; defaults to `php://input`.
 	 * @param ChunkSignatureVerifier|null $verifier checks the chunk signature
 	 *        chain, binding the bytes to the credential; null when the request
 	 *        carries no chunk signatures
@@ -118,11 +126,13 @@ class S3RequestBody {
 	 *        without Content-Length has to declare one. Nothing else bounds
 	 *        what lands in the temp directory: post_max_size does not apply
 	 *        to a raw body, and the quota only once it is stored.
+	 * @param array<string, string> $trailers receives the trailers of an
+	 *        `aws-chunked` body, by lower-case name
 	 * @return resource
 	 * @throws S3AuthException on a malformed chunked body, a bad signature or
 	 *         a body over `$maxBytes` (`EntityTooLarge`)
 	 */
-	public function toStream(IRequest $request, &$sha256 = null, $input = null, ?ChunkSignatureVerifier $verifier = null, ?int $maxBytes = null) {
+	public function toStream(IRequest $request, BodyHash $hash, ?ChunkSignatureVerifier $verifier = null, ?int $maxBytes = null, array &$trailers = []) {
 		if ($maxBytes !== null) {
 			$declared = $this->getDecodedLength($request);
 			if ($declared !== null && $declared > $maxBytes) {
@@ -130,11 +140,7 @@ class S3RequestBody {
 			}
 		}
 
-		$ownsInput = false;
-		if ($input === null) {
-			$input = fopen('php://input', 'rb');
-			$ownsInput = true;
-		}
+		$input = fopen('php://input', 'rb');
 		if ($input === false) {
 			throw new S3AuthException('InternalError', 'Cannot read request body', Http::STATUS_INTERNAL_SERVER_ERROR);
 		}
@@ -142,34 +148,25 @@ class S3RequestBody {
 		try {
 			$out = $this->tempFiles->open();
 		} catch (S3AuthException $e) {
-			if ($ownsInput) {
-				fclose($input);
-			}
+			fclose($input);
 			throw $e;
 		}
 
-		$hashCtx = hash_init('sha256');
-
+		$trailers = [];
 		try {
 			if ($this->isChunked($request)) {
-				$this->copyChunked($input, $out, $hashCtx, $verifier, $maxBytes);
+				$trailers = $this->copyChunked($input, $out, $hash, $verifier, $maxBytes);
 				$this->assertDecodedLength($request, ftell($out));
 			} else {
-				$this->copyRaw($input, $out, $hashCtx, $maxBytes);
+				$this->copyRaw($input, $out, $hash, $maxBytes);
 			}
 		} catch (\Throwable $e) {
 			fclose($out);
-			if ($ownsInput) {
-				fclose($input);
-			}
 			throw $e;
-		}
-
-		if ($ownsInput) {
+		} finally {
 			fclose($input);
 		}
 
-		$sha256 = hash_final($hashCtx);
 		rewind($out);
 		return $out;
 	}
@@ -178,13 +175,13 @@ class S3RequestBody {
 	 * Read a small body, an XML document, into a string.
 	 *
 	 * Goes through toStream(), so an `aws-chunked` body is decoded and its
-	 * chunk signatures are checked like any upload's, and `$sha256` is what
-	 * the handler compares with a literal `x-amz-content-sha256`.
+	 * chunk signatures are checked like any upload's.
 	 *
+	 * @param array<string, string> $trailers as toStream()
 	 * @throws S3AuthException as toStream()
 	 */
-	public function toString(IRequest $request, int $maxBytes, ?ChunkSignatureVerifier $verifier, &$sha256 = null): string {
-		$stream = $this->toStream($request, $sha256, null, $verifier, $maxBytes);
+	public function toString(IRequest $request, int $maxBytes, ?ChunkSignatureVerifier $verifier, BodyHash $hash, array &$trailers = []): string {
+		$stream = $this->toStream($request, $hash, $verifier, $maxBytes, $trailers);
 		try {
 			$body = stream_get_contents($stream);
 		} finally {
@@ -245,9 +242,8 @@ class S3RequestBody {
 	/**
 	 * @param resource $in
 	 * @param resource $out
-	 * @param \HashContext $hashCtx
 	 */
-	private function copyRaw($in, $out, \HashContext $hashCtx, ?int $maxBytes = null): void {
+	private function copyRaw($in, $out, BodyHash $hash, ?int $maxBytes = null): void {
 		$total = 0;
 		while (!feof($in)) {
 			$buf = fread($in, self::CHUNK);
@@ -259,7 +255,7 @@ class S3RequestBody {
 			}
 			$total += strlen($buf);
 			$this->assertWithin($total, $maxBytes);
-			hash_update($hashCtx, $buf);
+			$hash->update($buf);
 			if (fwrite($out, $buf) === false) {
 				throw new S3AuthException('InternalError', 'Failed writing request body', Http::STATUS_INTERNAL_SERVER_ERROR);
 			}
@@ -271,9 +267,9 @@ class S3RequestBody {
 	 *
 	 * @param resource $in
 	 * @param resource $out
-	 * @param \HashContext $hashCtx
+	 * @return array<string, string> the trailers, by lower-case name
 	 */
-	private function copyChunked($in, $out, \HashContext $hashCtx, ?ChunkSignatureVerifier $verifier = null, ?int $maxBytes = null): void {
+	private function copyChunked($in, $out, BodyHash $hash, ?ChunkSignatureVerifier $verifier = null, ?int $maxBytes = null): array {
 		$total = 0;
 		while (true) {
 			$line = $this->readLine($in);
@@ -292,8 +288,9 @@ class S3RequestBody {
 
 				// Unsigned: the payload decoded so far is complete for every SDK
 				// we have seen, and rejecting would turn a working upload into a
-				// failure.
-				return;
+				// failure. Unless it announced a checksum trailer: that one is
+				// now missing, which PayloadIntegrity refuses.
+				return [];
 			}
 
 			$line = trim($line);
@@ -335,7 +332,7 @@ class S3RequestBody {
 						hash('sha256', ''),
 					);
 				}
-				return;
+				return $this->readTrailers($in);
 			}
 
 			// The chunk header states its size, so a body that would grow past
@@ -346,7 +343,7 @@ class S3RequestBody {
 			// A signed chunk has to be hashed as a whole to check it, so keep it
 			// aside; chunk sizes are bounded by MAX_CHUNK_SIZE.
 			$chunkHash = $verifier === null ? null : hash_init('sha256');
-			$this->copyExactly($in, $out, $hashCtx, $size, $chunkHash);
+			$this->copyExactly($in, $out, $hash, $size, $chunkHash);
 
 			if ($verifier !== null) {
 				$verifier->verifyChunk(
@@ -358,6 +355,36 @@ class S3RequestBody {
 			// Each chunk's payload is followed by CRLF.
 			$this->consumeCrlf($in);
 		}
+	}
+
+	/**
+	 * Read the `name:value` lines after the final chunk, up to the blank line
+	 * that ends the body.
+	 *
+	 * @param resource $in
+	 * @return array<string, string> by lower-case name
+	 * @throws S3AuthException on a line that is not a trailer
+	 */
+	private function readTrailers($in): array {
+		$trailers = [];
+		while (($line = $this->readLine($in)) !== null) {
+			$line = trim($line);
+			if ($line === '') {
+				break;
+			}
+
+			$colon = strpos($line, ':');
+			if ($colon === false || count($trailers) >= self::MAX_TRAILERS) {
+				throw new S3AuthException(
+					'InvalidRequest',
+					'Malformed aws-chunked body: bad trailer',
+					Http::STATUS_BAD_REQUEST,
+				);
+			}
+			$trailers[strtolower(trim(substr($line, 0, $colon)))] = trim(substr($line, $colon + 1));
+		}
+
+		return $trailers;
 	}
 
 	/**
@@ -386,9 +413,8 @@ class S3RequestBody {
 	 *
 	 * @param resource $in
 	 * @param resource $out
-	 * @param \HashContext $hashCtx
 	 */
-	private function copyExactly($in, $out, \HashContext $hashCtx, int $size, ?\HashContext $chunkHash = null): void {
+	private function copyExactly($in, $out, BodyHash $hash, int $size, ?\HashContext $chunkHash = null): void {
 		$remaining = $size;
 		while ($remaining > 0) {
 			$buf = fread($in, (int)min($remaining, self::CHUNK));
@@ -402,7 +428,7 @@ class S3RequestBody {
 				}
 				continue;
 			}
-			hash_update($hashCtx, $buf);
+			$hash->update($buf);
 			if ($chunkHash !== null) {
 				hash_update($chunkHash, $buf);
 			}

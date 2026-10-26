@@ -118,6 +118,21 @@ def test_unsigned_payload(s3, bucket, prefix):
     assert s3.get(bucket, prefix + "x").body == b"unsigned"
 
 
+@pytest.mark.parametrize("payload_hash,status,code", [
+    ("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", 501, "NotImplemented"),
+    ("STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER", 501, "NotImplemented"),
+    ("SOMETHING-ELSE", 400, "InvalidArgument"),
+], ids=["sigv4a", "sigv4a-trailer", "unknown"])
+def test_unsupported_payload_hash(s3, bucket, prefix, payload_hash, status, code):
+    """A SigV4a stream claims chunk signatures this app cannot check; decoding
+    it anyway stored its body as if it had been sent unsigned."""
+    r = s3.put(bucket, prefix + "x", b"0\r\n\r\n", payload_hash=payload_hash,
+               headers={"Content-Encoding": "aws-chunked", "x-amz-decoded-content-length": "0"})
+    assert r.status == status
+    assert r.error_code == code
+    assert s3.get(bucket, prefix + "x").status == 404
+
+
 def test_other_region_in_scope(env, bucket, prefix):
     client = S3Client(env.endpoint, env.rw.access, env.rw.secret, region="eu-central-1")
     assert client.put(bucket, prefix + "x", b"x").status == 200
@@ -218,11 +233,15 @@ def test_failed_credentials_are_throttled(occ, sql, env, bucket, prefix):
         client.get(bucket, prefix + "x", secret="wrong")
         S3Client(env.endpoint, "NOSUCHKEY0000000000X", "x").head(bucket, prefix + "x")
         client.get(bucket, prefix + "x", amz_date=stamp(-3600))
+        # A chunk signature only fails once the body is read, past the
+        # request's own authentication; it is a wrong guess all the same.
+        r = client.put_chunked_signed(bucket, prefix + "x", [b"data"], tamper=lambda i, d: b"evil" if i == 0 else d)
+        assert r.error_code == "SignatureDoesNotMatch"
         rows = sql("SELECT metadata FROM oc_bruteforce_attempts WHERE action = ?", action)
-        assert len(rows) == 2
+        assert len(rows) == 3
         # The throttle is per address; the metadata says which key was tried.
         keys = sorted(json.loads(r["metadata"]).get("accessKey") for r in rows)
-        assert keys == sorted([env.rw.access, "NOSUCHKEY0000000000X"])
+        assert keys == sorted([env.rw.access, env.rw.access, "NOSUCHKEY0000000000X"])
     finally:
         occ("config:system:set", "auth.bruteforce.protection.enabled", "--type=boolean", "--value=false")
         occ("config:system:delete", "auth.bruteforce.protection.force.database")

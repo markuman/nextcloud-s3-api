@@ -182,6 +182,65 @@ def test_complete_with_too_many_parts(s3, bucket, one_part_upload):
     assert r.error_code == "MalformedXML"
 
 
+# ---- PutObject and UploadPart -------------------------------------------------
+#
+# Up to 1.7.0 only a literal x-amz-content-sha256 was checked on uploads.
+# With UNSIGNED-PAYLOAD a signed checksum header is all that ties the body to
+# the request, and a mismatch has to be BadDigest, as on S3.
+
+def sha256_b64(data):
+    return base64.b64encode(hashlib.sha256(data).digest()).decode()
+
+
+UPLOAD_CHECKSUMS = [
+    ("x-amz-checksum-crc32", crc32_b64),
+    ("x-amz-checksum-sha256", sha256_b64),
+    ("x-amz-checksum-crc64nvme", crc64nvme_b64),
+    ("Content-MD5", md5_b64),
+]
+UPLOAD_CHECKSUM_IDS = ["crc32", "sha256", "crc64nvme", "content-md5"]
+
+
+@pytest.mark.parametrize("header,checksum", UPLOAD_CHECKSUMS, ids=UPLOAD_CHECKSUM_IDS)
+def test_put_checks_the_checksum(s3, bucket, prefix, header, checksum):
+    # Not a multiple of eight bytes, so the CRC-64 tail is exercised too.
+    body = bytes(range(256)) * 41 + b"tail!"
+    key = prefix + "obj"
+
+    r = s3.put(bucket, key, b"swapped" + body[7:], payload_hash="UNSIGNED-PAYLOAD", headers={header: checksum(body)})
+    assert r.status == 400
+    assert r.error_code == "BadDigest"
+    assert s3.get(bucket, key).status == 404
+
+    r = s3.put(bucket, key, body, payload_hash="UNSIGNED-PAYLOAD", headers={header: checksum(body)})
+    assert r.status == 200, r.body
+    assert s3.get(bucket, key).body == body
+
+
+def test_malformed_content_md5_is_refused(s3, bucket, prefix):
+    r = s3.put(bucket, prefix + "obj", b"x", headers={"Content-MD5": "not-base64"})
+    assert r.status == 400
+    assert r.error_code == "InvalidDigest"
+
+
+def test_upload_part_checks_the_checksum(s3, boto, bucket, prefix):
+    key = prefix + "big.bin"
+    upload_id = boto.create_multipart_upload(Bucket=bucket, Key=key)["UploadId"]
+    try:
+        query = {"partNumber": "1", "uploadId": upload_id}
+        r = s3.put(bucket, key, b"tampered", query=query, payload_hash="UNSIGNED-PAYLOAD",
+                   headers={"x-amz-checksum-crc32": crc32_b64(b"the part")})
+        assert r.status == 400
+        assert r.error_code == "BadDigest"
+        assert boto.list_parts(Bucket=bucket, Key=key, UploadId=upload_id).get("Parts", []) == []
+
+        r = s3.put(bucket, key, b"the part", query=query, payload_hash="UNSIGNED-PAYLOAD",
+                   headers={"x-amz-checksum-crc32": crc32_b64(b"the part")})
+        assert r.status == 200, r.body
+    finally:
+        boto.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+
+
 # ---- upload size --------------------------------------------------------------
 
 def test_object_over_5_gib_is_refused_before_the_body_is_read(s3, bucket, prefix):

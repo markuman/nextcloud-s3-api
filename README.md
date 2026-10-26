@@ -105,6 +105,11 @@ unless `--allow-shared` is given, and `--folder /` (the whole home) is always re
 `/Documents`): for users who have never logged in, the skeleton is copied on their first login, into
 the bucket's folder if it has the same name.
 
+Buckets and keys can also be managed from scripts — with the
+[`markuman.nextcloud`](https://github.com/markuman/markuman.nextcloud) Ansible collection or the
+HTTP API behind the settings page, see [Managing buckets and keys
+programmatically](#-managing-buckets-and-keys-programmatically).
+
 <details>
 <summary><b>Requirements and update notes</b></summary>
 
@@ -175,6 +180,123 @@ s3 = boto3.client(
 
 s3.upload_file("file.txt", "my-bucket", "file.txt")
 ```
+
+---
+
+## 🤖 Managing buckets and keys programmatically
+
+Everything the settings page does — registering folders as buckets, creating and revoking API keys
+— goes through a small per-user HTTP API, which works just as well from a script.
+
+Every user manages **their own** buckets and keys, authenticated as themselves. There is no admin
+endpoint to create keys for someone else, on purpose: a secret generated for another person has
+already been seen by someone other than its owner. To provision bucket configs for many users,
+an admin uses [`occ s3api:bucket:create`](#-quick-start); the users (or their automation) then
+create keys here.
+
+### Ansible
+
+The [`markuman.nextcloud`](https://github.com/markuman/markuman.nextcloud) collection
+([Galaxy](https://galaxy.ansible.com/ui/repo/published/markuman/nextcloud/), 35.0.0 and later)
+wraps this API in modules: [`s3_bucket`](https://github.com/markuman/markuman.nextcloud/wiki/s3_bucket)
+creates and deletes buckets and their keys — idempotently, keys are identified by their label —
+[`s3_bucket_info`](https://github.com/markuman/markuman.nextcloud/wiki/s3_bucket_info) reads them,
+and the [`s3_buckets`](https://github.com/markuman/markuman.nextcloud/wiki/s3_buckets) lookup lists
+them.
+
+```yaml
+- name: Bucket with a key for the backup client
+  markuman.nextcloud.s3_bucket:
+    name: backup
+    folder: /S3/backup
+    create_folder: true
+    access_keys:
+      - label: restic
+        permission: readwrite
+  register: bucket
+  no_log: true  # created_keys carries the secret, returned only on creation
+```
+
+### HTTP API
+
+**Base URL:** `https://<nextcloud-host>/apps/s3_api/api/v1` (`/index.php/apps/s3_api/api/v1`
+without pretty URLs).
+
+**Authentication:** HTTP Basic as the user, ideally with an
+[app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices)
+(required anyway with two-factor authentication). Every request **must carry
+`OCS-APIRequest: true`** — without it Nextcloud's CSRF check answers `412`. No credentials: `401`.
+
+Request bodies are JSON (`Content-Type: application/json`); form-encoded works too. Responses are
+JSON; errors are `{"error": "<message>"}`.
+
+| Method   | Path                                   | Body                       | Success                         |
+|----------|----------------------------------------|----------------------------|---------------------------------|
+| `GET`    | `/buckets`                             |                            | `200`, list of buckets          |
+| `POST`   | `/buckets`                             | `folderPath`, `bucketName` | `201`, the bucket               |
+| `DELETE` | `/buckets/{id}`                        |                            | `200`, `{"status": "ok"}`       |
+| `GET`    | `/buckets/{id}/keys`                   |                            | `200`, list of keys, no secrets |
+| `POST`   | `/buckets/{id}/keys`                   | `permission`, `label`      | `201`, the key **with secret**  |
+| `DELETE` | `/buckets/{id}/keys/{keyId}`           |                            | `200`, `{"status": "ok"}`       |
+
+```bash
+NC=https://cloud.example.com
+AUTH=(-u "alice:<app-password>" -H 'OCS-APIRequest: true' -H 'Content-Type: application/json')
+
+# the folder has to exist; the API never creates one
+curl "${AUTH[@]}" -X MKCOL "$NC/remote.php/dav/files/alice/S3"
+
+curl "${AUTH[@]}" -X POST -d '{"folderPath": "/S3", "bucketName": "files"}' "$NC/apps/s3_api/api/v1/buckets"
+# 201 {"id":16,"userId":"alice","folderPath":"/S3","bucketName":"files","createdAt":"2026-10-26T14:13:55+00:00"}
+
+curl "${AUTH[@]}" -X POST -d '{"permission": "readwrite", "label": "restic"}' "$NC/apps/s3_api/api/v1/buckets/16/keys"
+# 201 {"id":9,"bucketId":16,"accessKey":"QWIYO3CF4BRYMCDKND9J","permission":"readwrite",
+#      "label":"restic","createdAt":"2026-10-26T14:13:55+00:00","secretKey":"Cll1IuhE4i6/ULwW7NQ…"}
+
+curl "${AUTH[@]}" "$NC/apps/s3_api/api/v1/buckets/16/keys"
+curl "${AUTH[@]}" -X DELETE "$NC/apps/s3_api/api/v1/buckets/16/keys/9"
+```
+
+<details>
+<summary><b>Fields, rules and errors</b></summary>
+
+<br>
+
+**Bucket:** `id`, `userId`, `folderPath` (relative to the user's home; `GET /buckets` reports
+where the folder is *now*, after renames), `bucketName`, `createdAt` (ISO 8601).
+
+**Key:** `id`, `bucketId`, `accessKey`, `permission`, `label` (`null` when none was given),
+`createdAt`, and `secretKey` in the response to `POST` only.
+
+**Creating a bucket** — `folderPath` and `bucketName` are required strings.
+* `bucketName`: 3–63 characters, lowercase letters, digits, dots and hyphens, starting and ending
+  with a letter or digit, no `..`. Unique per user, not per instance.
+* `folderPath`: an existing folder in the user's home, `/` for the home itself. It must not be,
+  contain or lie inside the folder of another bucket of the same user.
+* `400` for a missing or invalid parameter or a folder that does not exist, `409` for a name that
+  is taken or an overlapping folder.
+
+**Creating a key** — `permission` is `readonly` (default) or `readwrite`, `label` is optional, at
+most 255 characters. `400` for anything else.
+
+**Not found:** a bucket or key of another user answers `404`, exactly like one that does not
+exist, so ids cannot be probed. A key id under the wrong bucket id is `404` too.
+
+**Things to know:**
+* **The secret is returned once**, in the `201` of `POST …/keys`, and cannot be read again. Lost
+  it? Delete the key and create a new one.
+* **Creating a key is not idempotent** — each `POST` creates another key pair. Look for your
+  label in `GET …/keys` first. Labels are not required to be unique; the app does not check.
+* **Keys cannot be changed.** A different permission means a new key.
+* **Buckets are addressed by id.** To work with names, list them and filter.
+* **Deleting a bucket deletes its keys** and leaves the folder and its files alone.
+* Every create and delete is logged at info level and to `admin_audit`'s log when that app is
+  enabled.
+
+Documented since 1.7.1. The Ansible collection depends on it, so changes to it are announced in
+the [changelog](CHANGELOG.md).
+
+</details>
 
 ---
 
@@ -338,7 +460,10 @@ expired presigned URLs; `X-Amz-Expires` is capped at seven days, as on AWS. `hos
 `x-amz-*` header the request carries must be signed.
 
 The body is bound to the signature as far as the request allows: a literal `x-amz-content-sha256`
-is checked against it, and so are signed `aws-chunked` chunks. `DeleteObjects` additionally needs
+is checked against it, and so are signed `aws-chunked` chunks. `Content-MD5` and `x-amz-checksum-*`
+(as header or as `aws-chunked` trailer) are checked against the bytes on every upload; a mismatch is
+`400 BadDigest` and nothing is stored. SigV4a (`AWS4-ECDSA-P256-SHA256`) is not supported, its
+streaming payloads included. `DeleteObjects` additionally needs
 something the signature covers to pin its body down — a literal payload hash, a signed
 `Content-MD5`, or an `x-amz-checksum-*` header — as S3 requires a checksum there anyway; every SDK
 sends one.
@@ -348,7 +473,7 @@ Each API key is bound to **exactly one bucket** and is either `readonly` or `rea
 need `readwrite`. `ListBuckets` reports only that bucket — not every bucket the owning account
 happens to have — and any other bucket name answers `NoSuchBucket`, whether the account has such a
 bucket or not. Keys stop working when their account is disabled and are removed when it is
-deleted. Wrong secrets and unknown keys count towards Nextcloud's brute force protection and are
+deleted. Wrong secrets, wrong chunk signatures and unknown keys count towards Nextcloud's brute force protection and are
 logged as warnings with the access key they named. Creating and deleting buckets and keys, and
 every `DeleteObjects`, are logged at info level and to `admin_audit`'s audit log when that app is
 enabled.

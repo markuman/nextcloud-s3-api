@@ -1,5 +1,7 @@
 """aws-chunked request bodies, signed and unsigned."""
+import base64
 import os
+import zlib
 
 import pytest
 
@@ -37,12 +39,61 @@ def test_signed_chunks_for_conditional_write(s3, bucket, prefix):
     assert s3.get(bucket, key).body == b"one"
 
 
-@pytest.mark.parametrize("trailer", [None, ("x-amz-checksum-crc32", "AAAAAA==")])
+def crc32_b64(data):
+    return base64.b64encode(zlib.crc32(data).to_bytes(4, "big")).decode()
+
+
+@pytest.mark.parametrize("trailer", [None, ("x-amz-checksum-crc32", crc32_b64(b"hello world"))],
+                         ids=["no-trailer", "crc32"])
 def test_unsigned_trailer_framing(s3, bucket, prefix, trailer):
     chunks = [b"hello ", b"world"]
     r = s3.put_chunked_unsigned(bucket, prefix + "obj", chunks, trailer=trailer)
     assert r.status == 200, r.body
     assert s3.get(bucket, prefix + "obj").body == b"hello world"
+
+
+def test_trailer_checksum_is_checked(s3, bucket, prefix):
+    """The checksum in the trailer describes the decoded bytes; one that does
+    not match them is BadDigest, as on S3, and nothing is stored."""
+    r = s3.put_chunked_unsigned(bucket, prefix + "obj", [b"hello ", b"world"],
+                                trailer=("x-amz-checksum-crc32", crc32_b64(b"hello there")))
+    assert r.status == 400
+    assert r.error_code == "BadDigest"
+    assert s3.get(bucket, prefix + "obj").status == 404
+
+
+@pytest.mark.parametrize("final", [True, False], ids=["trailer-missing", "cut-short"])
+def test_announced_trailer_must_arrive(s3, bucket, prefix, final):
+    """`x-amz-trailer` is signed: the client committed to a checksum. Without
+    it, whoever strips the trailer and swaps the body would pass unchecked."""
+    r = s3.put_chunked_unsigned(bucket, prefix + "obj", [b"hello ", b"world"], final=final,
+                                headers={"x-amz-trailer": "x-amz-checksum-crc32"})
+    assert r.status == 400
+    assert r.error_code == "IncompleteBody"
+    assert s3.get(bucket, prefix + "obj").status == 404
+
+
+@pytest.mark.parametrize("checksum,status", [(b"hello world", 200), (b"hello there", 400)],
+                         ids=["matching", "mismatching"])
+def test_signed_chunks_with_trailer(s3, bucket, prefix, checksum, status):
+    """`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`: the checksum is checked
+    against the bytes, the `x-amz-trailer-signature` line is passed over."""
+    r = s3.put_chunked_signed(bucket, prefix + "obj", [b"hello ", b"world"],
+                              trailer=("x-amz-checksum-crc32", crc32_b64(checksum)))
+    assert r.status == status, r.body
+    if status == 200:
+        assert s3.get(bucket, prefix + "obj").body == b"hello world"
+    else:
+        assert r.error_code == "BadDigest"
+        assert s3.get(bucket, prefix + "obj").status == 404
+
+
+def test_unannounced_trailer_checksum_is_refused(s3, bucket, prefix):
+    r = s3.put_chunked_unsigned(bucket, prefix + "obj", [b"hello ", b"world"],
+                                trailer=("x-amz-checksum-crc32", crc32_b64(b"hello world")), announce=False)
+    assert r.status == 400
+    assert r.error_code == "InvalidRequest"
+    assert s3.get(bucket, prefix + "obj").status == 404
 
 
 @pytest.mark.parametrize("declared,final", [(5, True), (500, True), (500, False)],

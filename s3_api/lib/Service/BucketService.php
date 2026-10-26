@@ -14,7 +14,6 @@ use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
 use OCP\Files\NotPermittedException;
 use OCP\Files\Storage\ISharedStorage;
-use OCP\Share\IShare;
 use Psr\Log\LoggerInterface;
 
 class BucketService {
@@ -108,7 +107,7 @@ class BucketService {
 	 *
 	 * A bucket from before 1.6.2 is bound here, on its path -- by the
 	 * migration, or on first use if the folder could not be found then. See
-	 * mayBindLegacy() for which folders that may be.
+	 * bindLegacyBucket() for which folders that may be.
 	 */
 	public function resolveFolder(Bucket $bucket): ?Folder {
 		$userId = $bucket->getUserId();
@@ -138,6 +137,26 @@ class BucketService {
 		return $node;
 	}
 
+	/**
+	 * Bind a path-bound bucket to the folder its path names now.
+	 *
+	 * The path is all a bucket from before 1.6.2 has, and it may no longer
+	 * name the folder that was registered: renamed away, and something else
+	 * put in its place. Only one thing there is someone else's doing -- an
+	 * incoming share, which another user creates and Nextcloud mounts under
+	 * its own name without asking. Binding the bucket to that would make the
+	 * attack this binding is there to stop permanent, so a share is never
+	 * taken by its path; such a bucket has to be registered again.
+	 *
+	 * Up to 1.7.0 a share older than the bucket was taken. The share's age
+	 * says nothing about when it appeared at the path, though: a group share
+	 * from before the bucket shows up when its recipient joins the group,
+	 * which can be long after.
+	 *
+	 * Anything else at the path -- the user's own folders, group folders,
+	 * external storage -- is placed there by the user or an admin and is
+	 * taken as it is.
+	 */
 	private function bindLegacyBucket(Bucket $bucket, Folder $userFolder): ?Folder {
 		try {
 			$node = $userFolder->get($bucket->getFolderPath());
@@ -149,12 +168,12 @@ class BucketService {
 			return null;
 		}
 
-		if (!$this->mayBindLegacy($bucket, $node)) {
+		if (self::isShared($node)) {
 			// Info, not warning: the settings page resolves every bucket on
 			// each load, so this would repeat for as long as the bucket
 			// exists. The migration already warned once, where the admin
 			// looks during an upgrade.
-			$this->logger->info('Not binding S3 bucket to a share that appeared after it was created; register the folder again', [
+			$this->logger->info('Not binding S3 bucket to an incoming share by its path; register the folder again', [
 				'app' => 's3_api',
 				'bucket' => $bucket->getBucketName(),
 				'userId' => $bucket->getUserId(),
@@ -176,37 +195,6 @@ class BucketService {
 	}
 
 	/**
-	 * Whether a path-bound bucket may be bound to the folder its path names
-	 * now.
-	 *
-	 * The path is all a bucket from before 1.6.2 has, and it may no longer
-	 * name the folder that was registered: renamed away, and something else
-	 * put in its place. Only one thing there is someone else's doing -- an
-	 * incoming share, which another user creates and Nextcloud mounts under
-	 * its own name without asking. Binding the bucket to that would make the
-	 * attack this binding is there to stop permanent. So a share is only
-	 * taken if it already existed when the bucket was registered, as it does
-	 * for a bucket that was registered on it. Anything else at the path --
-	 * the user's own folders, group folders, external storage -- is placed
-	 * there by the user or an admin and is taken as it is.
-	 *
-	 * A federated share carries no share time this can read, so it is not
-	 * taken; such a bucket has to be registered again.
-	 */
-	private function mayBindLegacy(Bucket $bucket, Folder $node): bool {
-		if (!self::isShared($node)) {
-			return true;
-		}
-
-		$sharedAt = $this->shareTime($node);
-		$createdAt = $bucket->getCreatedAt();
-
-		return $sharedAt instanceof \DateTimeInterface
-			&& $createdAt instanceof \DateTimeInterface
-			&& $sharedAt < $createdAt;
-	}
-
-	/**
 	 * Whether a folder is, or lies inside, an incoming share -- something
 	 * another user put into this home, under a name of their choosing.
 	 */
@@ -217,35 +205,6 @@ class BucketService {
 		// string, so nothing breaks with files_sharing disabled.
 		return $storage->instanceOfStorage(ISharedStorage::class)
 			|| $storage->instanceOfStorage('OCA\\Files_Sharing\\ISharedStorage');
-	}
-
-	/**
-	 * When the share a folder is in was created, the earliest if several
-	 * shares of it to this user are mounted as one.
-	 *
-	 * Read from the mount, not the storage: the share the storage carries is
-	 * one Nextcloud assembles from all of them, without a share time. The
-	 * mount keeps the real ones. A mount that has none to give -- a federated
-	 * share -- yields null.
-	 */
-	private function shareTime(Folder $node): ?\DateTimeInterface {
-		try {
-			$mount = $node->getMountPoint();
-			if (!method_exists($mount, 'getGroupedShares')) {
-				return null;
-			}
-
-			$earliest = null;
-			foreach ($mount->getGroupedShares() as $share) {
-				$time = $share instanceof IShare ? $share->getShareTime() : null;
-				if ($time instanceof \DateTimeInterface && ($earliest === null || $time < $earliest)) {
-					$earliest = $time;
-				}
-			}
-			return $earliest;
-		} catch (\Throwable) {
-			return null;
-		}
 	}
 
 	/**

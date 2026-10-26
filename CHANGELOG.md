@@ -3,6 +3,53 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
+## 1.7.1 – 2026-10-26
+
+**Hardening release** after a regression review of 1.7.0: one medium and four low findings, all
+addressed. No migration. Operator-visible: uploads with a checksum that does not match are
+refused, and buckets from before 1.6.2 that sit on an incoming share are no longer bound by path.
+
+### Security
+- **Upload checksums were not checked.** `PutObject` and `UploadPart` only compared a literal
+  `x-amz-content-sha256` with the body; `Content-MD5` and `x-amz-checksum-*` — as header or as
+  `aws-chunked` trailer — were ignored. With `UNSIGNED-PAYLOAD` a signed checksum is all that ties
+  the body to the request, so a body swapped in flight (behind a TLS-terminating proxy), or
+  corrupted on the way, was stored without complaint. Every claim is now checked against the
+  decoded bytes, hashed while the body is read, and a mismatch is `BadDigest`, as on S3; nothing
+  is stored. A trailer checksum not announced in `x-amz-trailer` is `InvalidRequest`; one that is
+  announced — `x-amz-trailer` is signed — but never arrives is `IncompleteBody`, as on S3, so
+  stripping the trailer does not switch the check off. The signature line of a signed trailer is
+  passed over: the checksum is checked against the bytes, and those are bound by the chunk
+  signatures already. Current
+  SDKs (boto3 ≥ 1.36 and others) send these checksums by default; the CRC-64/NVME one costs
+  noticeably more CPU than the others, since PHP has no native implementation.
+- **`+xml` types were served inline.** RSS, GPX, KML and every other `…+xml` object opened from a
+  presigned URL rendered as an XML document on the Nextcloud origin — an XHTML root makes that a
+  page with working forms. They are served as downloads now, like HTML, SVG and plain XML.
+- **SigV4a streaming bodies were taken as unsigned.** `STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD`
+  bodies were decoded, but their chunk signatures never checked. They are `NotImplemented` now,
+  and any `x-amz-content-sha256` that is neither a hash nor a supported sentinel is
+  `InvalidArgument`, as on S3.
+- **A wrong chunk signature was not throttled.** Only failures of the request signature counted
+  towards brute force protection; a chunk signature fails later, while the body is read. Both
+  count now, and both are logged as a warning.
+- **A bucket from before 1.6.2 could still be bound to a foreign share.** The rule was: a share
+  older than the bucket is taken. But a group share from before the bucket only appears at its
+  path when the user joins the group — possibly after the bucket's folder was renamed away.
+  **Operator-visible:** an incoming share is no longer bound by path at all; such a bucket answers
+  `NoSuchBucket`, logs why, and its owner registers the folder again. Buckets already bound, by
+  the 1.6.2 migration or since, are not affected.
+
+### Documentation
+- **The per-user HTTP API behind the settings page is documented** (README, *Managing buckets and
+  keys programmatically*): `/apps/s3_api/api/v1/buckets` and `…/buckets/{id}/keys`, with Basic
+  auth as the user (an app password) and `OCS-APIRequest: true`. Users and their automation can
+  create buckets and keys without the web UI; keys still belong to their owners. Nothing about the
+  API changed, it just was not written down.
+- The README links the [`markuman.nextcloud`](https://github.com/markuman/markuman.nextcloud)
+  Ansible collection, whose `s3_bucket` and `s3_bucket_info` modules and `s3_buckets` lookup
+  (35.0.0 and later) manage buckets and keys through that API.
+
 ## 1.7.0 – 2026-10-25
 
 ### Added

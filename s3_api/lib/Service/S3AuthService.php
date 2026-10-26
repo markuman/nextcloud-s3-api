@@ -29,6 +29,14 @@ class S3AuthService {
 	/** Longest lifetime a presigned URL may ask for, as on AWS: seven days. */
 	private const MAX_PRESIGNED_EXPIRY_SECONDS = 7 * 24 * 3600;
 
+	/** What `x-amz-content-sha256` may say besides a literal hash. */
+	private const PAYLOAD_SENTINELS = [
+		'UNSIGNED-PAYLOAD',
+		'STREAMING-UNSIGNED-PAYLOAD-TRAILER',
+		'STREAMING-AWS4-HMAC-SHA256-PAYLOAD',
+		'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER',
+	];
+
 	public function __construct(
 		private ApiKeyService $apiKeyService,
 		private BucketMapper $bucketMapper,
@@ -113,6 +121,7 @@ class S3AuthService {
 
 		$secretKey = $this->apiKeyService->decryptSecretKey($apiKey);
 		$this->verifySignature($request, $parsed, $secretKey, $query);
+		$this->assertKnownPayloadHash($request);
 
 		return [
 			'userId' => $apiKey->getUserId(),
@@ -122,6 +131,41 @@ class S3AuthService {
 			'signedHeaders' => $parsed['signedHeaders'],
 			'chunkVerifier' => $this->chunkVerifierFor($request, $parsed, $secretKey),
 		];
+	}
+
+	/**
+	 * Refuse a payload hash this app cannot honour, as S3 refuses one it does
+	 * not know.
+	 *
+	 * The value is signed, so this is no defence against a third party; it
+	 * keeps the app from guessing at what the sender meant. A SigV4a stream
+	 * (`STREAMING-AWS4-ECDSA-P256-SHA256-*`) in particular claims signed
+	 * chunks this app cannot check, and decoding it anyway would store the
+	 * body as if it had been sent unsigned.
+	 *
+	 * @throws S3AuthException
+	 */
+	private function assertKnownPayloadHash(IRequest $request): void {
+		$hash = trim((string)$request->getHeader('x-amz-content-sha256'));
+		if ($hash === ''
+			|| in_array($hash, self::PAYLOAD_SENTINELS, true)
+			|| PayloadIntegrity::isLiteralSha256(strtolower($hash))) {
+			return;
+		}
+
+		if (str_starts_with($hash, 'STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD')) {
+			throw new S3AuthException(
+				'NotImplemented',
+				'SigV4a streaming payloads are not supported',
+				Http::STATUS_NOT_IMPLEMENTED,
+			);
+		}
+
+		throw new S3AuthException(
+			'InvalidArgument',
+			'x-amz-content-sha256 must be UNSIGNED-PAYLOAD, a supported STREAMING-* value, or a valid SHA-256 hash',
+			Http::STATUS_BAD_REQUEST,
+		);
 	}
 
 	/**

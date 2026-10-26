@@ -26,8 +26,10 @@ use OCP\AppFramework\Http;
  * compromised proxy that terminates TLS, say -- could replace the content while
  * the request still authenticates.
  *
- * The final zero-length chunk is signed over the empty string, and a trailer,
- * if present, is signed separately with `AWS4-HMAC-SHA256-TRAILER`.
+ * The final zero-length chunk is signed over the empty string. A trailer,
+ * if present, carries a signature of its own (`AWS4-HMAC-SHA256-TRAILER`),
+ * which is not checked: the trailer is a checksum, PayloadIntegrity checks it
+ * against the bytes, and the bytes are already bound by this chain.
  */
 class ChunkSignatureVerifier {
 
@@ -71,25 +73,6 @@ class ChunkSignatureVerifier {
 			throw new S3AuthException(
 				'SignatureDoesNotMatch',
 				'The chunk signature does not match the data sent',
-				Http::STATUS_FORBIDDEN,
-			);
-		}
-
-		$this->previousSignature = $expected;
-	}
-
-	/**
-	 * Check the signature over a trailer, which closes the chain.
-	 *
-	 * @throws S3AuthException when the signature does not match
-	 */
-	public function verifyTrailer(string $signature, string $trailerSha256): void {
-		$expected = $this->sign('AWS4-HMAC-SHA256-TRAILER', $trailerSha256);
-
-		if (!hash_equals($expected, strtolower(trim($signature)))) {
-			throw new S3AuthException(
-				'SignatureDoesNotMatch',
-				'The trailer signature does not match the data sent',
 				Http::STATUS_FORBIDDEN,
 			);
 		}

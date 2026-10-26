@@ -72,14 +72,16 @@ class S3ObjectResponse extends Response implements ICallbackResponse {
 	/**
 	 * Whether a browser would render the type as a document of its own, with
 	 * markup, forms or script, rather than display it passively.
+	 *
+	 * Every `+xml` type counts: a browser renders RSS, GPX, KML and the like
+	 * as an XML document, and one whose root is in the XHTML namespace is a
+	 * page with working forms.
 	 */
 	private static function isActiveContent(string $mimeType): bool {
 		$type = strtolower(trim(explode(';', $mimeType)[0]));
 
-		return in_array($type, [
+		return str_ends_with($type, '+xml') || in_array($type, [
 			'text/html',
-			'application/xhtml+xml',
-			'image/svg+xml',
 			'text/xml',
 			'application/xml',
 			'text/javascript',
