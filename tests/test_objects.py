@@ -2,7 +2,10 @@
 import hashlib
 import os
 import re
+import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -107,6 +110,35 @@ def test_nested_key_is_a_nextcloud_file(s3, nc, env, bucket, prefix):
     r = nc.download(f"{env.main.folder}/{prefix}a/b/c.txt")
     assert r.status == 200
     assert r.body == b"via s3"
+
+
+def test_concurrent_puts_create_shared_parents(s3, bucket, prefix):
+    """Distinct keys must not race while creating their shared parent folders."""
+    workers = 10
+    for batch in range(3):
+        start = Barrier(workers)
+
+        def upload(i):
+            key = f"{prefix}batch-{batch}/source/.argo/object-{i}.yaml"
+            body = f"object: {i}\n".encode()
+            start.wait(timeout=30)
+            # Nextcloud can briefly lock a shared ancestor while updating it.
+            # Retry SlowDown as an AWS client would, but never hide a 404.
+            for attempt in range(6):
+                result = s3.put(bucket, key, body)
+                if result.status != 503 or result.error_code != "SlowDown":
+                    break
+                time.sleep(0.05 * 2 ** attempt)
+            assert result.status == 200, (key, result.status, result.body.decode())
+            return key, body
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            uploaded = list(pool.map(upload, range(workers)))
+
+        for key, body in uploaded:
+            result = s3.get(bucket, key)
+            assert result.status == 200, (key, result.body)
+            assert result.body == body
 
 
 @pytest.mark.parametrize("suffix", [

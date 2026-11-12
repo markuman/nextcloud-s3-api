@@ -1727,13 +1727,22 @@ class S3Controller extends Controller {
 			}
 			try {
 				$sub = $folder->get($part);
-				if (!($sub instanceof Folder)) {
-					throw new S3AuthException('InvalidArgument', 'Path component is not a directory', Http::STATUS_CONFLICT);
-				}
-				$folder = $sub;
 			} catch (NotFoundException) {
-				$folder = $folder->newFolder($part);
+				// Different object keys can need the same missing parent. Lock
+				// only its creation, not the uploads, and check again after waiting:
+				// another request may now have created it and populated its cache.
+				$sub = $this->objectLock->withLock($folder, $part, function () use ($folder, $part) {
+					try {
+						return $folder->get($part);
+					} catch (NotFoundException) {
+						return $folder->newFolder($part);
+					}
+				});
 			}
+			if (!($sub instanceof Folder)) {
+				throw new S3AuthException('InvalidArgument', 'Path component is not a directory', Http::STATUS_CONFLICT);
+			}
+			$folder = $sub;
 		}
 
 		return $folder;
