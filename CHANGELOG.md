@@ -3,6 +3,20 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
+## 1.7.2 – 2026-11-13
+
+**Bugfix release.** No migration.
+
+### Fixed
+- **Concurrent uploads contended on shared parent folders.** Several `PutObject` requests whose
+  keys share a parent that does not exist yet all tried to create it, and the losers ran into
+  Nextcloud's file locking — `503 SlowDown` that clients had to retry, under load sometimes past
+  their retry budget. Creating a missing parent folder now takes the app's lock for that folder
+  and checks again once it holds it, so one request creates it and the others reuse it; uploads
+  themselves stay concurrent. The warning "Tried to create an object store folder that already
+  exists" in the log came from the same race and was harmless. (#3, thanks @sidohaakma)
+  The `404` responses reported in #2 do not come from this race and are still being looked into.
+
 ## 1.7.1 – 2026-10-26
 
 **Hardening release** after a regression review of 1.7.0: one medium and four low findings, all
