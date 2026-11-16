@@ -2,6 +2,7 @@
 import hashlib
 import os
 import re
+import socket
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -214,7 +215,7 @@ def test_key_length_limit(s3, bucket, prefix):
 
 @pytest.mark.parametrize("name,status,code", [
     ("n" * 300, 400, "InvalidArgument"),
-    (".htaccess", 403, "AccessDenied"),
+    (".htaccess", 400, "InvalidArgument"),
 ], ids=["long-segment", "reserved-name"])
 def test_names_nextcloud_refuses_are_client_errors(s3, bucket, prefix, name, status, code):
     """Names Nextcloud will not store are the client's problem, not a 500."""
@@ -373,3 +374,92 @@ def test_if_match_on_read(s3, bucket, prefix):
     assert r.status == 412
     assert r.error_code == "PreconditionFailed"
     assert s3.head(bucket, prefix + "obj", headers={"If-Match": '"stale"'}).status == 412
+
+
+# ---- names Nextcloud reserves or the admin forbids (1.7.3) --------------------
+
+@pytest.mark.parametrize("name", ["x.part", "X.Part", "d.part/x", ".part"])
+def test_part_names_are_refused(s3, env, container, datadir, nc, bucket, prefix, name):
+    """Nextcloud takes a name ending in `.part` for an upload in progress:
+    the quota does not limit what is written to it, and the file cache never
+    records it. Up to 1.7.2 such an object sat on the disk outside the quota
+    and outside every listing, the web UI's included."""
+    r = s3.put(bucket, prefix + name, b"x" * 1000)
+    assert r.status == 400, r.body
+    assert r.error_code == "InvalidArgument"
+    # Refused before anything was written, the prefix folder included.
+    path = f"{datadir}/{nc.user}/files/{env.main.folder}/{prefix}"
+    assert container("sh", "-c", f"ls -A '{path}' 2>/dev/null || true") == ""
+
+
+def test_part_names_are_refused_as_copy_and_upload_targets(s3, bucket, prefix):
+    s3.put(bucket, prefix + "src", b"x")
+    r = s3.put(bucket, prefix + "dst.part", headers={"x-amz-copy-source": f"{bucket}/{prefix}src"})
+    assert r.status == 400
+    assert r.error_code == "InvalidArgument"
+    r = s3.request("POST", bucket, prefix + "big.part", query={"uploads": ""}, raw_query="uploads")
+    assert r.status == 400
+    assert r.error_code == "InvalidArgument"
+
+
+def test_admin_naming_rules_apply(s3, occ, bucket, prefix):
+    """Folder::newFile() does not check names, WebDAV checks them itself --
+    and up to 1.7.2 this app did not, so forbidden characters and the
+    Windows compatibility mode did not apply to S3."""
+    occ("config:system:set", "forbidden_filename_characters", "0", "--value=§")
+    try:
+        for key in (prefix + "a§b", prefix + "a§b/c"):
+            r = s3.put(bucket, key, b"x")
+            assert r.status == 400, key
+            assert r.error_code == "InvalidArgument"
+        assert s3.put(bucket, prefix + "ab", b"x").status == 200
+    finally:
+        occ("config:system:delete", "forbidden_filename_characters")
+
+
+def test_body_cut_short_is_not_stored(s3, bucket, prefix):
+    """A body that ends before its Content-Length -- the client gave up, a
+    proxy dropped the connection -- must not replace the object with its
+    first part. Without a checksum, as on presigned and UNSIGNED-PAYLOAD
+    uploads, nothing but the length tells."""
+    key = prefix + "obj"
+    assert s3.put(bucket, key, b"original").status == 200
+
+    uri = s3.uri(bucket, key)
+    amz_date = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    headers = {"Host": s3.host, "x-amz-date": amz_date, "x-amz-content-sha256": "UNSIGNED-PAYLOAD"}
+    headers["Authorization"], _ = s3.sign("PUT", uri, "", headers, "UNSIGNED-PAYLOAD", amz_date)
+    head = f"PUT {uri} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    head += "Content-Length: 100000\r\nConnection: close\r\n\r\n"
+
+    host, _, port = s3.host.partition(":")
+    with socket.create_connection((host, int(port or 80)), timeout=60) as sock:
+        sock.sendall(head.encode() + b"y" * 1000)
+        sock.shutdown(socket.SHUT_WR)
+        reply = b""
+        while chunk := sock.recv(65536):
+            reply += chunk
+
+    # mod_php hands the short body on, so the app answers -- not Apache.
+    head, _, body = reply.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 400"), head[:200]
+    assert b"<Code>IncompleteBody</Code>" in body, body
+    assert s3.get(bucket, key).body == b"original"
+
+
+@pytest.mark.parametrize("content_type,body", [
+    ("application/json", b'{"path": 5, "x": [1, 2]}'),
+    ("application/json", b'{"path": "elsewhere/x"}'),
+    ("application/vnd.api+json", b'{"path": "elsewhere/x"}'),
+    ("application/x-www-form-urlencoded", b"path=elsewhere%2Fx&a=b"),
+])
+def test_body_is_stored_whatever_its_content_type(s3, bucket, prefix, content_type, body):
+    """Nextcloud decodes a PUT body sent as JSON or form data once anything
+    asks for a request parameter -- and the routed key was one. A `path` in
+    the body then replaced it: 400 InvalidURI, or a TypeError and a 500 for
+    one that is not a string. `curl --data-binary` sends form data by
+    default, rclone JSON for `.json` files."""
+    r = s3.put(bucket, prefix + "obj.json", body, headers={"Content-Type": content_type})
+    assert r.status == 200, r.body
+    assert s3.get(bucket, prefix + "obj.json").body == body
+

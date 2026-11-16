@@ -126,9 +126,16 @@ programmatically](#-managing-buckets-and-keys-programmatically).
   wrong secrets from anywhere slow down — and eventually lock out — every S3 client of the
   instance
 * **Give `tempdirectory` room, ideally its own volume.** Every upload is written there in full
-  before Nextcloud stores it, and a multipart upload is assembled there on completion. The app
-  bounds a single body (5 GiB, and the free space of the bucket owner), but parallel uploads add
-  up
+  before Nextcloud stores it, a multipart upload is assembled there on completion, and a ranged
+  `UploadPartCopy` cuts its range out there. The app bounds each of them (5 GiB per body or part,
+  the free space of the bucket owner, and the free space of the temp directory as it is when the
+  request starts), but parallel uploads add up — completing a 100 GB multipart upload needs
+  100 GB there
+* **PHP keeps a second copy of every request body**, outside of `tempdirectory`: it buffers
+  `php://input` in a temp file of its own, in `upload_tmp_dir` or else the system temp directory
+  (`sys_temp_dir`, usually `/tmp`). So each upload passes through temp space twice, once of them
+  where Nextcloud's setting does not reach. If `/tmp` is a tmpfs, that copy is held in RAM: point
+  `upload_tmp_dir` (and `sys_temp_dir`) at a disk with room, as for large WebDAV uploads
 * `app:enable` runs the migrations. `occ upgrade` is for core upgrades and will not touch an app.
   To update after bumping the version: `occ app:disable s3_api && occ app:enable s3_api`
 
@@ -226,6 +233,8 @@ without pretty URLs).
 [app password](https://docs.nextcloud.com/server/latest/user_manual/en/session_management.html#managing-devices)
 (required anyway with two-factor authentication). Every request **must carry
 `OCS-APIRequest: true`** — without it Nextcloud's CSRF check answers `412`. No credentials: `401`.
+An app password whose file access is switched off gets `403` from every endpoint: a key would
+reach the files without the token's restriction.
 
 Request bodies are JSON (`Content-Type: application/json`); form-encoded works too. Responses are
 JSON; errors are `{"error": "<message>"}`.
@@ -385,16 +394,20 @@ retries transient S3 errors, so the usual race resolves on its own.
 | GetObject                | GET    | `Range`, `If-Match`, `If-None-Match`                      |
 | HeadObject               | HEAD   |                                                           |
 | PutObject                | PUT    | `If-Match`, `If-None-Match`, `aws-chunked` bodies         |
-| CopyObject               | PUT    | `x-amz-copy-source`, same bucket only                     |
+| CopyObject               | PUT    | `x-amz-copy-source`, same bucket only, conditions below   |
 | DeleteObject             | DELETE |                                                           |
 | DeleteObjects            | POST   | `?delete`                                                 |
 | CreateMultipartUpload    | POST   | `?uploads`                                                |
 | UploadPart               | PUT    | `?uploadId&partNumber`                                    |
-| UploadPartCopy           | PUT    | plus `x-amz-copy-source-range`                            |
-| CompleteMultipartUpload  | POST   | `?uploadId`                                               |
+| UploadPartCopy           | PUT    | plus `x-amz-copy-source-range`, `x-amz-copy-source-if-*`  |
+| CompleteMultipartUpload  | POST   | `?uploadId`, `If-Match`, `If-None-Match`                  |
 | AbortMultipartUpload     | DELETE | `?uploadId`                                               |
 | ListParts                | GET    | `?uploadId`                                               |
 | ListMultipartUploads     | GET    | `?uploads`                                                |
+
+`CopyObject` takes `If-Match` / `If-None-Match` on the target and `x-amz-copy-source-if-match`,
+`-if-none-match`, `-if-modified-since`, `-if-unmodified-since` on the source; `UploadPartCopy` the
+latter four.
 
 Any other subresource (`?acl`, `?tagging`, `?lifecycle`, …) answers `NotImplemented` rather than
 being ignored — an ignored subresource would otherwise be handled as an operation on the object
@@ -420,7 +433,19 @@ the rest are listed with a placeholder until a later listing, `GET` or `HEAD` ha
 Nextcloud's own etag with a `-0` suffix, which marks it as not an MD5 so tools do not compare it
 with the content. It is not the object's ETag either, so do not use one from a listing for
 `If-Match` — `HEAD` gives the real one. Without that cap, one listing of a folder full of large
-files could read terabytes.
+files could read terabytes. One request hashes a given file at a time; others asking for it
+meanwhile wait briefly and then get `503 SlowDown`, so retries of a slow first `HEAD` do not pile
+up hashes of one large file. Should the hashing process die, the file answers `503` for up to a
+minute before another request takes over. Files with a current ETag — everything written through
+this API — never wait.
+
+A recorded ETag stays current while the file keeps the size, mtime and Nextcloud etag it had when
+it was recorded; otherwise it is computed again from the content. Written through this API, that
+is exact. A change made outside it (WebDAV, sync client, the disk) that keeps size and mtime is
+caught where Nextcloud's etag is unique per write — object storage as primary, most external
+storages — but not on local storage, where Nextcloud's etag is itself derived from mtime, inode,
+device and size, and an in-place rewrite within the same second keeps all four. Compare-and-swap
+between writers that all go through this API is not affected.
 
 </details>
 
@@ -428,8 +453,10 @@ files could read terabytes.
   `If-Match: <etag>` replaces exactly that version. Concurrent conditional writes to one key are
   serialised, so exactly one of a set of racing creates or updates succeeds. The lock behind
   that is a database row; should a PHP process die while holding it, conditional writes to that
-  one key answer `503 SlowDown` until it counts as stale after fifteen minutes (other keys, reads
-  and unconditional writes are unaffected).
+  one key answer `503 SlowDown` until it counts as stale after fifteen minutes, longer for a large
+  write (completing a multipart upload, a copy) by the time its bytes take at 4 MiB/s — about 43
+  minutes more for 10 GiB, six hours at most. Other keys, reads and unconditional writes are
+  unaffected.
 * **Streaming.** Uploads are not held in memory. `Content-Encoding: aws-chunked` with a trailing
   checksum — the default for current AWS SDKs — is decoded rather than stored verbatim. Where the
   client signs each chunk (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) the signature chain is verified,
@@ -437,14 +464,29 @@ files could read terabytes.
   covers only the headers.
 * **Multipart parts** live in a hidden `.s3-uploads/` folder inside the bucket while an upload is
   in flight, excluded from listings. Uploads never completed or aborted are reclaimed after a week
-  by a background job.
+  by a background job, and go with their bucket when it is deleted. A `.s3-uploads` that is not a
+  folder on the bucket's own storage — a share or mount someone placed there — is not used:
+  multipart uploads answer `403 AccessDenied` until it is removed.
 * **Keys map to paths.** A key containing `/` creates folders, so `a/b` and `a` cannot both be
   objects. Keys that cannot be a path as they stand are refused with `InvalidArgument`: empty,
   `.` or `..` segments, a backslash, control characters, bytes that are not UTF-8, and Unicode
   that is not in NFC (Nextcloud stores every name in NFC, so `e` + combining accent would be a
   second name for `é`). Files whose names no key can spell are left out of listings.
+* **Nextcloud's naming rules apply to writes**, as on WebDAV: forbidden names (`.htaccess`),
+  characters, extensions and the Windows compatibility mode, in every segment of the key, and at
+  most 250 bytes per segment (the file cache's limit). Names ending in `.part` are always
+  refused — Nextcloud reserves them for uploads in progress and neither counts them against the
+  quota nor shows them anywhere. Reading and deleting still
+  reach a file stored under such a name some other way.
 * **A bucket is its folder**, not the folder's path: rename or move the folder and the bucket
   follows it. Moved to the trash, the bucket answers `NoSuchBucket` until it is restored.
+* **JSON and form bodies.** A `PUT` sent as `application/json` (or `…+json`) or
+  `application/x-www-form-urlencoded` — rclone does the first for `.json` files, `curl
+  --data-binary` the second by default — is stored as it is. But Nextcloud reads such a body into
+  memory and decodes it as soon as any code asks the request for a parameter, and the Text app
+  does that on every file write. Past `memory_limit` (JSON takes several times its size once
+  decoded) the request dies in Nextcloud with a `500`, through WebDAV just the same. Send large
+  files as `application/octet-stream`, or raise `memory_limit`.
 * **Limits.** 5 GiB per `PutObject` or `UploadPart`, as on S3, and never more than the free space
   of the bucket owner (`403 AccessDenied` otherwise, before the body is read). XML bodies
   (`DeleteObjects`, `CompleteMultipartUpload`) up to 4 MiB. At most 1000 multipart uploads in
@@ -495,13 +537,21 @@ enabled.
 tests/run.sh                         # Nextcloud 34, throwaway container
 NC_VERSION=35 tests/run.sh -k multipart -x
 NC_VERSION=master tests/run.sh       # next major, built from the daily tarball
+DB=mariadb tests/run.sh              # or DB=postgres, in a second container
 KEEP=1 tests/run.sh                  # keep the container, reuse it next run
 ```
 
 Needs `podman` (or `ENGINE=docker`), `curl` and `uv`. The script starts the official
-`nextcloud:<version>-apache` image with SQLite, mounts `s3_api/` read-only, enables the app and
-runs the pytest suite in `tests/` against `http://127.0.0.1:18080`. Buckets and keys are created by
-the suite itself through the settings API.
+`nextcloud:<version>-apache` image with SQLite (or MariaDB / PostgreSQL next to it), mounts
+`s3_api/` read-only, enables the app and runs the pytest suite in `tests/` against
+`http://127.0.0.1:18080`. Buckets and keys are created by the suite itself through the settings
+API.
+
+Static analysis against Nextcloud's public API:
+
+```bash
+cd tests/phpstan && composer install && vendor/bin/phpstan analyse
+```
 
 The gits3 tests run [gits3](https://github.com/markuman/gits3srv)'s own S3 client and a real
 push / clone / gc cycle through it. They look for `../gits3srv/gits3.py` (override with

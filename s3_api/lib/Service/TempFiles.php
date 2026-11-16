@@ -44,4 +44,53 @@ class TempFiles {
 
 		return $handle;
 	}
+
+	/**
+	 * Bytes free in the temp directory, or null when that cannot be told.
+	 *
+	 * Checked before a copy of known size goes there: the bucket owner's
+	 * quota says nothing about this directory, which every user of the
+	 * instance shares.
+	 */
+	public function freeSpace(): ?int {
+		$free = @disk_free_space($this->tempManager->getTempBaseDir());
+		return $free === false ? null : (int)$free;
+	}
+
+	/**
+	 * @throws S3AuthException when `$bytes` will not fit into the temp
+	 *         directory
+	 */
+	public function assertRoomFor(int|float $bytes): void {
+		$free = $this->freeSpace();
+		if ($free !== null && $bytes > $free) {
+			throw new S3AuthException(
+				'EntityTooLarge',
+				'Not enough temporary space on the server for this request',
+				Http::STATUS_BAD_REQUEST,
+			);
+		}
+	}
+
+	/**
+	 * fwrite() all of `$data`, or fail.
+	 *
+	 * fwrite() reports a short write -- a full disk -- as a smaller count,
+	 * not as false, and a check for false alone lets the copy carry on with
+	 * bytes missing.
+	 *
+	 * @param resource $out
+	 * @throws S3AuthException
+	 */
+	public static function writeAll($out, string $data): void {
+		$length = strlen($data);
+		$written = 0;
+		while ($written < $length) {
+			$n = fwrite($out, $written === 0 ? $data : substr($data, $written));
+			if ($n === false || $n === 0) {
+				throw new S3AuthException('InternalError', 'Could not write to a temporary file', Http::STATUS_INTERNAL_SERVER_ERROR);
+			}
+			$written += $n;
+		}
+	}
 }

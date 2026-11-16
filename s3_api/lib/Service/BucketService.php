@@ -22,6 +22,7 @@ class BucketService {
 		private BucketMapper $bucketMapper,
 		private ApiKeyMapper $apiKeyMapper,
 		private IRootFolder $rootFolder,
+		private MultipartService $multipartService,
 		private LoggerInterface $logger,
 	) {
 	}
@@ -89,9 +90,15 @@ class BucketService {
 		return $this->bucketMapper->insert($bucket);
 	}
 
+	/**
+	 * Keys first, so no request starts on the bucket while it goes; then its
+	 * unfinished multipart uploads, whose parts sit in the bucket's folder
+	 * and could not be found once the bucket record is gone.
+	 */
 	public function deleteBucket(int $id, string $userId): Bucket {
 		$bucket = $this->bucketMapper->findByIdAndUser($id, $userId);
 		$this->apiKeyMapper->deleteByBucketId($bucket->getId());
+		$this->multipartService->discardAll($this->resolveFolder($bucket), $bucket->getId());
 		$this->bucketMapper->delete($bucket);
 		return $bucket;
 	}

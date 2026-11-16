@@ -199,3 +199,29 @@ def test_nfd_prefix_matches_nothing(s3, bucket, prefix):
     put_many(s3, bucket, [prefix + "caf\u00e9/x"])
     assert s3.list_all(bucket, prefix + "cafe\u0301/") == []
     assert s3.list_all(bucket, prefix + "caf\u00e9/") == [prefix + "caf\u00e9/x"]
+
+
+def test_paging_through_nested_folders(s3, bucket, prefix):
+    """A continuation skips whole folders the earlier pages went through,
+    instead of walking them again; the keys and their order stay the same."""
+    keys = sorted(prefix + k for k in ["a/1", "a/2", "b/x/1", "b/x/2", "b/y", "c", "d/e/f/g", "d-e", "d/z", "d0"])
+    put_many(s3, bucket, keys)
+    for page in (1, 2, 3):
+        assert s3.list_all(bucket, prefix, max_keys=page) == keys
+
+
+def test_common_prefixes_are_not_repeated_on_later_pages(s3, bucket, prefix):
+    put_many(s3, bucket, [prefix + k for k in ["a/1", "b", "c", "d/1"]])
+    objects, prefixes, token = [], [], None
+    for _ in range(10):
+        params = {"prefix": prefix, "delimiter": "/", "max_keys": 1}
+        if token:
+            params["continuation_token"] = token
+        root = s3.list_v2(bucket, **params).xml()
+        objects += keys_of(root)
+        prefixes += prefixes_of(root)
+        token = root.findtext(f"{NS}NextContinuationToken")
+        if root.findtext(f"{NS}IsTruncated") != "true":
+            break
+    assert objects == [prefix + "b", prefix + "c"]
+    assert prefixes == [prefix + "a/", prefix + "d/"]

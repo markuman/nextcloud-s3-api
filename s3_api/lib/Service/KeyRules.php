@@ -89,6 +89,14 @@ final class KeyRules {
 	}
 
 	/**
+	 * Whether a file or folder name is one Nextcloud reserves for uploads in
+	 * progress: the file cache skips it, and so does the quota.
+	 */
+	public static function isPartName(string $segment): bool {
+		return str_ends_with(strtolower($segment), '.part');
+	}
+
+	/**
 	 * Whether `$path` is the multipart scratch area at the bucket root, or
 	 * inside it. Internal: not addressable as a key, not listable.
 	 */

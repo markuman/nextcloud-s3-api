@@ -305,7 +305,7 @@ class S3ResponseBuilder {
 	 * plus one key has been seen, so listing a small prefix in a large bucket
 	 * does not traverse the whole tree.
 	 *
-	 * @return array{objects: list<array{key: string, lastModified: string, etag: string, size: int}>, commonPrefixes: list<string>, truncated: bool, next: ?string}
+	 * @return array{objects: list<array{key: string, lastModified: string, etag: string, size: int|float}>, commonPrefixes: list<string>, truncated: bool, next: ?string}
 	 */
 	private function collect(
 		Folder $bucketFolder,
@@ -370,7 +370,7 @@ class S3ResponseBuilder {
 	}
 
 	/**
-	 * @param list<array{key: string, lastModified: string, size: int, file: File}> $objects
+	 * @param list<array{key: string, lastModified: string, size: int|float, file: File}> $objects
 	 * @param list<string> $commonPrefixes
 	 */
 	private function walk(
@@ -393,6 +393,26 @@ class S3ResponseBuilder {
 		} catch (NotFoundException) {
 			return;
 		}
+
+		// Drop what this page cannot contain before sorting: entries outside
+		// the prefix, and everything a previous page already returned. A
+		// folder is dropped as a whole when every key it can hold sorts at or
+		// before `$after` -- it does unless `$after` lies inside it or before
+		// it -- so a continuation does not walk again every subtree the pages
+		// before it went through. Without that, paging through a tree cost
+		// O(n²) in folder listings.
+		$children = array_values(array_filter($children, function ($node) use ($folderKey, $prefix, $after): bool {
+			$key = $folderKey . $node->getName();
+			if ($node instanceof Folder) {
+				$key .= '/';
+				if ($after !== '' && strcmp($key, $after) < 0 && !str_starts_with($after, $key)) {
+					return false;
+				}
+				return $this->pathMayContainPrefix($key, $prefix);
+			}
+			return ($prefix === '' || str_starts_with($key, $prefix))
+				&& ($after === '' || strcmp($key, $after) > 0);
+		}));
 
 		// Visit entries in key order, not in whatever order the storage
 		// returns. Enumeration stops as soon as a page is full, so if the walk
@@ -508,8 +528,8 @@ class S3ResponseBuilder {
 	 * not an MD5 (it is how multipart ETags look), so tools skip comparing
 	 * it, and zero parts is a count no real multipart object has.
 	 *
-	 * @param list<array{key: string, lastModified: string, size: int, file: File}> $objects
-	 * @return list<array{key: string, lastModified: string, etag: string, size: int}>
+	 * @param list<array{key: string, lastModified: string, size: int|float, file: File}> $objects
+	 * @return list<array{key: string, lastModified: string, etag: string, size: int|float}>
 	 */
 	private function withEtags(array $objects): array {
 		$cached = $this->etagService->cachedMany(array_column($objects, 'file'));
@@ -571,7 +591,7 @@ class S3ResponseBuilder {
 	}
 
 	/**
-	 * @param list<array{key: string, lastModified: string, etag: string, size: int}> $objects
+	 * @param list<array{key: string, lastModified: string, etag: string, size: int|float}> $objects
 	 */
 	private function contentsXml(array $objects): string {
 		$xml = '';

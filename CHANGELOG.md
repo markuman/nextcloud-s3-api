@@ -3,6 +3,157 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com).
 
+## 1.7.3 – 2026-11-16
+
+**Bugfix and hardening release** after a review of 1.7.2: one high, five medium and eight low
+findings. Eleven are fixed; three only in part, as their entries say — listing a very large flat
+folder, the first hash of a large file, and external changes on local storage that keep size and
+mtime. A MariaDB-only `500` under contention turned up on the way. One migration, which adds a
+column (`s3api_etags.nc_etag`) and rewrites nothing; recorded ETags, compound multipart ETags
+included, stay as they are. Operator-visible: Nextcloud's naming rules now apply to S3 writes,
+uploads cut short are refused, and app passwords without file access can no longer manage
+buckets and keys.
+
+### Security
+- **Keys ending in `.part` got around the quota and were invisible.** `Folder::newFile()` does not
+  check names — WebDAV calls `verifyPath()` itself before it gets there, this app did not. Nextcloud
+  takes a name ending in `.part` for an upload in progress: the quota wrapper does not limit what is
+  written to it, and the file cache never records it. So `x.part`, or anything below `d.part/`, sat
+  on the disk outside the quota and outside every listing, the web UI's included — up to 5 GiB per
+  `PUT`, as often as a readwrite key liked. Every segment of a key is now checked with Nextcloud's
+  `IFilenameValidator` before `PutObject`, `CopyObject` and the multipart calls write anything, and
+  `.part` is refused on its own as well, whatever the configuration. **Operator-visible:** the
+  admin's naming rules — forbidden names, characters, extensions, the Windows compatibility mode —
+  apply to S3 now; they did not before. Refused names answer `400 InvalidArgument`, `.htaccess`
+  included (was `403 AccessDenied`). So do key segments of 251 to 255 bytes: the validator stops
+  at 250, the file cache's limit for a name, where the app's own check allowed 255. Reads and
+  deletes still reach a file stored under such a name some other way.
+
+  **Finding objects stored this way by 1.7.2 or earlier:** they are in no listing, not in the web
+  UI and not in the quota, so only the data directory shows them. As the web server user:
+
+  ```bash
+  find /path/to/data -path '*/files/*' -name '*.part' ! -name '*.ocTransferId*.part'
+  ```
+
+  This lists files and folders whose name ends in `.part` below users' `files/` (and group folders
+  under `__groupfolders/` are found too if you drop `-path`); the excluded pattern is WebDAV's own
+  temporary upload files, which are fine to leave. Everything below a listed folder is affected as
+  well. These objects could be read with `GET`, so they may hold real data — a `*.iso.part` from a
+  downloads folder, say. To keep one, rename it on the disk to a name without `.part` and let
+  Nextcloud pick it up: `occ files:scan --path="/<user>/files/<folder>"`. What you do not want,
+  delete with `rm`; nothing in Nextcloud's database refers to it. With object storage as primary
+  storage there is no data directory to search.
+- **An app password without file access could issue itself S3 keys.** Such a token gets an empty
+  filesystem from Nextcloud, but creating a key does not touch the filesystem, and the key then
+  reaches the files without any token — so without the restriction. The settings API answers `403`
+  to such tokens on every endpoint. (`#[PasswordConfirmationRequired]` was considered and left out:
+  the settings page would need the confirmation dialog, and the documented HTTP API is used with
+  app passwords from automation.)
+
+### Fixed
+- **Truncated or wrong bytes stored with `200`.**
+  - A plain request body was not held to its `Content-Length`. Whether PHP hands on a body that was
+    cut short depends on the SAPI; without a checksum — presigned and `UNSIGNED-PAYLOAD` uploads
+    usually have none — the first part of it replaced the object. Now `400 IncompleteBody`, as on
+    S3, and nothing is stored.
+  - Short writes to the temp directory (a full disk) were taken for complete ones: `fwrite()`
+    reports them as a smaller count, not as `false`. Every copy now writes all of its bytes or
+    fails.
+  - `UploadPartCopy` with a range did not check its seek: on a storage that cannot seek, the part
+    was copied from offset 0. It skips forward by reading now, as ranged `GET` always did, and a
+    source that ends early fails the request.
+  - `CompleteMultipartUpload` stopped at a failed read of a part and stored what it had — and then
+    deleted the parts. A failed read is an error now, and the assembled size is checked against the
+    sum of the parts before anything is stored.
+  - Every write checks the size Nextcloud stored against what it was given, and answers `500`
+    instead of `200` when they differ; a part of the wrong size is removed again. The size is read
+    back from the file, so an unconditional write racing another one to the same key can trip
+    this too; that costs the client a retry, and the warning in the log names both causes.
+- **Conditional headers were ignored where S3 honours them.** `If-Match` / `If-None-Match` on
+  `CompleteMultipartUpload` and `CopyObject`, and `x-amz-copy-source-if-match`, `-if-none-match`,
+  `-if-modified-since`, `-if-unmodified-since` on `CopyObject` and `UploadPartCopy`: a
+  compare-and-swap client got `200` for an update it had lost. They are evaluated now — the target
+  conditions under the object lock, as on `PutObject` — and answer `412 PreconditionFailed`. A
+  multipart upload whose condition fails stays as it was and can be completed or aborted, as on S3;
+  `CompleteMultipartUpload` checks once before assembling the object as well, so a `412` does not
+  cost a copy of it first.
+- **A large write under the object lock could have its lock broken.** The lock counts as stale after
+  fifteen minutes, sized for one body of at most 5 GiB. A conditional `CompleteMultipartUpload` or
+  `CopyObject` now stores its object while holding the lock, and that object can be any size. A
+  write that knows its size extends the lock by the time it takes at 4 MiB/s, at most by six hours
+  — about 43 minutes for 10 GiB. That much longer, after a crash, conditional writes to the key
+  answer `503`.
+- **Parallel first parts of a multipart upload could fail with `403`.** SDKs send the first parts
+  at once, and each of them created the upload's folder; Nextcloud waits 25 ms for the winner of
+  that race and then refuses the losers — a `403` no client retries. The folder is now made by
+  `CreateMultipartUpload`, and the shared `.s3-uploads` root under the app's lock, the same fix as
+  #3 for parent folders. A part still creates a missing folder — uploads started before 1.7.3 have
+  none yet — but only under that lock and while the upload exists: a part racing an abort used to
+  leave a folder behind that nothing would ever remove. One case remains, logged with its path: an
+  upload from before 1.7.3 aborted while its very first part is being written.
+- **The temp directory was not bounded everywhere.** A ranged `UploadPartCopy` wrote its range
+  there unchecked, and completion checked the bucket's free space but not the temp directory's —
+  a 100 GB object needs 100 GB there. Both check now, and so does every upload body;
+  `UploadPartCopy` also takes at most 5 GiB per part and the bucket's free space, like `UploadPart`.
+  The README now says that PHP keeps a second copy of every request body outside of
+  `tempdirectory`, which on a tmpfs `/tmp` is RAM.
+- **Conditional writes could fail with `500` on MariaDB / MySQL.** InnoDB answers several requests
+  waiting on one key of the lock table's unique index with a deadlock, not with a duplicate key,
+  and that was not taken as "the lock is held". It is now, for taking, breaking and releasing a
+  lock, and for the ETag table. Found by the new database matrix in CI; SQLite and PostgreSQL never
+  raise it.
+- **A share or mount named `.s3-uploads` in the bucket was used for parts.** On a bucket that is
+  the home folder, another user could share a folder of that name: parts went into it, to its
+  owner, and pruning would have deleted it. A scratch folder that is not on the bucket's own
+  storage is refused (`403`) and left alone.
+- **Deleting a bucket left its unfinished uploads behind**, and with the bucket record gone the
+  cleanup job could no longer find their parts. They go with the bucket now, upload by upload:
+  `.s3-uploads` belongs to the folder, and another user's bucket on the same folder (a share, a
+  group folder) keeps its uploads. A part that cannot be removed — being written, on a read-only
+  share — is logged, and the bucket goes anyway. Parts left by a bucket deleted before 1.7.3 stay
+  in its folder's `.s3-uploads`, where the owner can delete them.
+- **A recorded ETag was only checked against size and mtime.** A change that kept both — a client
+  that sets the mtime, a write within the same second — kept the old ETag, and `If-Match` matched a
+  version that was gone. Nextcloud's etag is the third criterion now. That closes it where
+  Nextcloud's etag is unique per write (object storage as primary, most external storages); on
+  local storage it is itself derived from mtime, inode, device and size, and an in-place rewrite
+  within the same second still goes unnoticed — see the README. Rows from before are trusted once
+  more and completed on their next read, so nothing is hashed again on upgrade.
+- **The first `HEAD` or `GET` of a large file written outside the API hashes all of it before
+  answering**, and client retries each started a hash of their own. One request hashes a file at a
+  time now; the others wait briefly and then get `503 SlowDown`. A hasher that dies blocks the file
+  for a minute, after which another request takes over. Still open: a file large enough to take
+  longer to hash than a client keeps retrying fails that client, as it did before. Files written
+  through the API are never hashed on read.
+- **Listings walked the whole tree again for every page.** A continuation skips folders the earlier
+  pages went through, and entries outside the prefix or before the marker are dropped before
+  sorting. Common prefixes that sort before the continuation point are no longer repeated. A single
+  folder with very many entries is still read in full for each page; Nextcloud's file API offers
+  no way to read a slice of it.
+- **A `PUT` body sent as JSON or form data could replace the key.** The routed path was a request
+  parameter, and asking for one makes Nextcloud decode such a body; a top-level `path` in it took
+  the route's place — `400 InvalidURI`, or a `500` for one that was not a string. `curl
+  --data-binary` sends form data by default, rclone JSON for `.json` files. The handlers take no
+  parameters now; the path comes from the request URI alone, checked against the one Nextcloud
+  routed by. **Not fixed, and not the app's to fix:** Nextcloud still reads such a body into memory
+  whenever any code asks for a parameter — the Text app does on every file write — and a JSON body
+  past `memory_limit` kills the request, through WebDAV just the same. See the README.
+- **A completed multipart upload could be reported as failed.** Removing its parts ran after the
+  object was stored, and a failure there answered `503`; the client's retry with `If-Match` then
+  met the new ETag and got `412`. Cleaning up is best effort now, and the cleanup job takes what is
+  left.
+- An `aws-chunked` chunk size of more than 16 hex digits converted to an undefined value — 0 among
+  them, which reads as the final chunk. Not exploitable, the signature covers the data; refused
+  before converting now.
+- The query string was parsed twice, once for the signature and once for the handlers. One parser
+  now, so the two cannot drift apart.
+
+### Development
+- CI runs the suite on MariaDB and PostgreSQL as well (`DB=mariadb|postgres tests/run.sh`), for the
+  oldest and newest stable Nextcloud, and PHPStan against `nextcloud/ocp` (`tests/phpstan/`). The
+  `sql` test fixture goes through Nextcloud's own database connection, so it works on all three.
+
 ## 1.7.2 – 2026-11-13
 
 **Bugfix release.** No migration.

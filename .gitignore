@@ -10,3 +10,6 @@
 # test suite
 __pycache__/
 /tests/.pytest_cache/
+
+# static analysis
+/tests/phpstan/vendor/

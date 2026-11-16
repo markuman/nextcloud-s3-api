@@ -1,0 +1,31 @@
+# Static analysis against Nextcloud's public API (nextcloud/ocp), oldest
+# supported major. Run from this directory:
+#
+#   composer install && vendor/bin/phpstan analyse
+#
+# Dependencies are pinned in composer.lock, nextcloud/ocp to a release of the
+# oldest supported major; `composer update` moves them deliberately.
+#
+# CI does the same, see .github/workflows/test.yml.
+parameters:
+  level: 5
+  paths:
+    - ../../s3_api/lib
+  scanDirectories:
+    - vendor/nextcloud/ocp
+  scanFiles:
+    - stubs.php
+  # OCP's PHPDoc types are narrower than what the server hands out at
+  # runtime: getFreeSpace() is documented int|float and returns false on
+  # some storages, Folder::get() throws more than it declares.
+  treatPhpDocTypesAsCertain: false
+  ignoreErrors:
+    - identifier: catch.neverThrown
+    # Any int is a valid HTTP status for us; OCP narrows it to a union.
+    - message: '#\$statusCode of class OCP\\AppFramework\\Http\\DataDisplayResponse constructor expects#'
+    # A string on purpose, so nothing breaks with files_sharing disabled.
+    - message: '#instanceOfStorage\(\) expects class-string#'
+      path: ../../s3_api/lib/Service/BucketService.php
+    # The private fallback for Nextcloud 33, see the method.
+    - message: '#OC_Util#'
+      path: ../../s3_api/lib/Command/BucketCreate.php

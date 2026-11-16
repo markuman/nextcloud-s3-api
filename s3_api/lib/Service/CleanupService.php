@@ -68,7 +68,12 @@ class CleanupService {
 				if ($folder !== null) {
 					$this->multipartService->discard($folder, $upload);
 				} else {
-					// The bucket is gone; the parts went with it.
+					// The bucket or its folder is gone. Deleting a bucket
+					// takes its parts along (BucketService::deleteBucket());
+					// one deleted before 1.7.3 may have left them in a
+					// `.s3-uploads` folder, which nothing here can locate
+					// any more -- the bucket record was what knew the folder.
+					// A folder that is gone took its parts with it.
 					$this->uploadMapper->delete($upload);
 				}
 				$removed++;

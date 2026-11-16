@@ -2,9 +2,11 @@
 #
 # Integration tests against a throwaway Nextcloud.
 #
-# Starts the official Nextcloud image (SQLite, no external services) with
-# s3_api mounted read-only into custom_apps, enables the app and runs the
-# pytest suite in tests/ against it. Buckets and keys are created by the suite
+# Starts the official Nextcloud image with s3_api mounted read-only into
+# custom_apps, enables the app and runs the pytest suite in tests/ against it.
+# SQLite by default; MariaDB or PostgreSQL in a container next to it, since
+# the object lock and the ETag table rest on how each database enforces a
+# unique index. Buckets and keys are created by the suite
 # itself through the app's settings API, so nothing here knows about them.
 #
 # Usage:
@@ -17,6 +19,7 @@
 #                "master" builds an image from Nextcloud's daily master tarball
 #                (the next major), see nextcloud-master.Containerfile
 #   REFRESH=1    with NC_VERSION=master: fetch a new daily even if one is built
+#   DB           sqlite (default), mariadb or postgres
 #   NC_PORT      host port, default 18080
 #   KEEP=1       leave the container running, and reuse it on the next run
 #   ENGINE       podman (default) or docker
@@ -28,8 +31,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NC_VERSION="${NC_VERSION:-34}"
 NC_PORT="${NC_PORT:-18080}"
 ENGINE="${ENGINE:-podman}"
+DB="${DB:-sqlite}"
 NAME="s3api-test-nc${NC_VERSION}"
+if [[ "${DB}" != "sqlite" ]]; then
+	NAME="${NAME}-${DB}"
+fi
+DB_NAME="${NAME}-db"
+NET="${NAME}-net"
 IMAGE="docker.io/library/nextcloud:${NC_VERSION}-apache"
+DB_PASSWORD="s3api-test-db"
 ADMIN_PASSWORD="s3api-test-admin"
 BOB_PASSWORD="s3api-test-bob"
 
@@ -44,7 +54,8 @@ teardown() {
 		"${ENGINE}" exec "${NAME}" sh -c 'tail -n 20 /var/www/html/data/nextcloud.log 2>/dev/null' >&2 || true
 	fi
 	if [[ "${KEEP:-0}" != "1" ]]; then
-		"${ENGINE}" rm -f "${NAME}" >/dev/null 2>&1 || true
+		"${ENGINE}" rm -f "${NAME}" "${DB_NAME}" >/dev/null 2>&1 || true
+		"${ENGINE}" network rm "${NET}" >/dev/null 2>&1 || true
 	else
 		echo "==> container ${NAME} left running on http://127.0.0.1:${NC_PORT}" >&2
 	fi
@@ -75,21 +86,66 @@ if [[ "${NC_VERSION}" == "master" ]]; then
 	build_master_image
 fi
 
+# The database container, and how the Nextcloud image is told about it.
+start_db() {
+	case "${DB}" in
+		sqlite)
+			db_args=(-e SQLITE_DATABASE=nextcloud)
+			return
+			;;
+		mariadb)
+			"${ENGINE}" run -d --name "${DB_NAME}" --network "${NET}" --network-alias db \
+				-e MARIADB_ROOT_PASSWORD="${DB_PASSWORD}" -e MARIADB_DATABASE=nextcloud \
+				-e MARIADB_USER=nextcloud -e MARIADB_PASSWORD="${DB_PASSWORD}" \
+				docker.io/library/mariadb:11 --transaction-isolation=READ-COMMITTED --binlog-format=ROW >/dev/null
+			db_ready=(healthcheck.sh --connect --innodb_initialized)
+			db_args=(-e MYSQL_HOST=db -e MYSQL_DATABASE=nextcloud -e MYSQL_USER=nextcloud -e MYSQL_PASSWORD="${DB_PASSWORD}")
+			;;
+		postgres)
+			"${ENGINE}" run -d --name "${DB_NAME}" --network "${NET}" --network-alias db \
+				-e POSTGRES_DB=nextcloud -e POSTGRES_USER=nextcloud -e POSTGRES_PASSWORD="${DB_PASSWORD}" \
+				docker.io/library/postgres:17 >/dev/null
+			db_ready=(pg_isready -U nextcloud -d nextcloud -h 127.0.0.1)
+			db_args=(-e POSTGRES_HOST=db -e POSTGRES_DB=nextcloud -e POSTGRES_USER=nextcloud -e POSTGRES_PASSWORD="${DB_PASSWORD}")
+			;;
+		*)
+			echo "DB must be sqlite, mariadb or postgres" >&2
+			exit 2
+			;;
+	esac
+	db_args+=(--network "${NET}")
+
+	echo "==> waiting for ${DB}"
+	for _ in $(seq 1 60); do
+		if "${ENGINE}" exec "${DB_NAME}" "${db_ready[@]}" >/dev/null 2>&1; then
+			return
+		fi
+		sleep 1
+	done
+	echo "${DB} did not come up" >&2
+	exit 1
+}
+
+trap teardown EXIT
 if [[ "${KEEP:-0}" == "1" ]] && running; then
 	echo "==> reusing ${NAME}"
 else
-	"${ENGINE}" rm -f "${NAME}" >/dev/null 2>&1 || true
-	echo "==> starting ${IMAGE} on 127.0.0.1:${NC_PORT}"
+	"${ENGINE}" rm -f "${NAME}" "${DB_NAME}" >/dev/null 2>&1 || true
+	if [[ "${DB}" != "sqlite" ]]; then
+		"${ENGINE}" network rm "${NET}" >/dev/null 2>&1 || true
+		"${ENGINE}" network create "${NET}" >/dev/null
+	fi
+	start_db
+	echo "==> starting ${IMAGE} with ${DB} on 127.0.0.1:${NC_PORT}"
 	"${ENGINE}" run -d --name "${NAME}" \
 		-p "127.0.0.1:${NC_PORT}:80" \
-		-e SQLITE_DATABASE=nextcloud \
+		"${db_args[@]}" \
 		-e NEXTCLOUD_ADMIN_USER=admin \
 		-e NEXTCLOUD_ADMIN_PASSWORD="${ADMIN_PASSWORD}" \
 		-e NEXTCLOUD_TRUSTED_DOMAINS="127.0.0.1 localhost" \
 		-v "${ROOT}/s3_api:/var/www/html/custom_apps/s3_api:ro,z" \
 		"${IMAGE}" >/dev/null
 fi
-trap teardown EXIT
 
 echo "==> waiting for the installation"
 for _ in $(seq 1 180); do

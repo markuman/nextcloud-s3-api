@@ -1,4 +1,5 @@
 """The settings API behind the personal settings page."""
+import json
 import secrets
 
 import pytest
@@ -173,3 +174,37 @@ def test_bad_key_parameters_are_client_errors(nc, folder, payload):
 def test_bad_bucket_parameters_are_client_errors(nc, folder):
     assert nc.api("POST", "/buckets", {"folderPath": ["/" + folder], "bucketName": name()}).status == 400
     assert nc.api("POST", "/buckets", {"folderPath": "/" + folder, "bucketName": 123}).status == 400
+
+
+def test_app_password_without_file_access_is_refused(make_user, occ, sql, base_url):
+    """An app password whose filesystem access is switched off gets no files
+    from Nextcloud -- but up to 1.7.2 it could issue itself an S3 key, and
+    the key reaches the files without the token's restriction."""
+    from conftest import Nextcloud
+    user = make_user()
+    folder = "data"
+    user.mkcol(folder)
+    bucket = user.create_bucket("/" + folder, name())
+
+    def app_password(label, filesystem):
+        out = occ("user:auth-tokens:add", "--password-from-env", f"--name={label}", user.user,
+                  env={"NC_PASS": user.password})
+        token = out.strip().splitlines()[-1].strip()
+        tokens = json.loads(occ("user:auth-tokens:list", user.user, "--output=json"))
+        (token_id,) = [t["id"] for t in tokens if t["name"] == label]
+        # Before the token is first used, so nothing has it cached.
+        sql("UPDATE oc_authtoken SET scope = ? WHERE id = ?", json.dumps({"filesystem": filesystem}), token_id)
+        return Nextcloud(base_url, user.user, token)
+
+    limited = app_password("no-files", False)
+    for method, path, payload in [
+        ("GET", "/buckets", None),
+        ("POST", "/buckets", {"folderPath": "/" + folder, "bucketName": name()}),
+        ("GET", f"/buckets/{bucket['id']}/keys", None),
+        ("POST", f"/buckets/{bucket['id']}/keys", {"permission": "readwrite"}),
+    ]:
+        r = limited.api(method, path, payload)
+        assert r.status == 403, (method, path, r.status)
+
+    full = app_password("files", True)
+    assert full.api("POST", f"/buckets/{bucket['id']}/keys", {"permission": "readwrite"}).status == 201

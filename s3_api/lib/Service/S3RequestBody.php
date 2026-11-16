@@ -159,6 +159,7 @@ class S3RequestBody {
 				$this->assertDecodedLength($request, ftell($out));
 			} else {
 				$this->copyRaw($input, $out, $hash, $maxBytes);
+				$this->assertContentLength($request, ftell($out));
 			}
 		} catch (\Throwable $e) {
 			fclose($out);
@@ -240,6 +241,33 @@ class S3RequestBody {
 	}
 
 	/**
+	 * Hold a plain body to its `Content-Length`.
+	 *
+	 * Whether PHP hands on a body that was cut short -- the client gave up,
+	 * a proxy dropped the connection -- depends on the SAPI. Without a
+	 * checksum, which presigned and `UNSIGNED-PAYLOAD` uploads usually lack,
+	 * nothing else would notice, and the stored object would be the first
+	 * part of what was sent, replacing whatever was there. WebDAV checks the
+	 * same for the same reason.
+	 *
+	 * @throws S3AuthException
+	 */
+	private function assertContentLength(IRequest $request, int|false $written): void {
+		$declared = (string)$request->getHeader('content-length');
+		if ($declared === '' || !ctype_digit($declared)) {
+			return;
+		}
+
+		if ((int)$declared !== $written) {
+			throw new S3AuthException(
+				'IncompleteBody',
+				'You did not provide the number of bytes specified by the Content-Length HTTP header',
+				Http::STATUS_BAD_REQUEST,
+			);
+		}
+	}
+
+	/**
 	 * @param resource $in
 	 * @param resource $out
 	 */
@@ -248,7 +276,10 @@ class S3RequestBody {
 		while (!feof($in)) {
 			$buf = fread($in, self::CHUNK);
 			if ($buf === false) {
-				break;
+				if (feof($in)) {
+					break;
+				}
+				throw new S3AuthException('IncompleteBody', 'The request body could not be read', Http::STATUS_BAD_REQUEST);
 			}
 			if ($buf === '') {
 				continue;
@@ -256,9 +287,7 @@ class S3RequestBody {
 			$total += strlen($buf);
 			$this->assertWithin($total, $maxBytes);
 			$hash->update($buf);
-			if (fwrite($out, $buf) === false) {
-				throw new S3AuthException('InternalError', 'Failed writing request body', Http::STATUS_INTERNAL_SERVER_ERROR);
-			}
+			TempFiles::writeAll($out, $buf);
 		}
 	}
 
@@ -314,8 +343,22 @@ class S3RequestBody {
 				);
 			}
 
-			$size = (int)hexdec($sizeHex);
-			if ($size < 0 || $size > self::MAX_CHUNK_SIZE) {
+			// Past 16 hex digits hexdec() returns a float, and casting one
+			// that does not fit to int is undefined -- 0 among the results,
+			// which reads as the final chunk. Eight digits already exceed
+			// MAX_CHUNK_SIZE, so anything longer (leading zeros aside) is
+			// out of range before it is converted.
+			$significant = ltrim($sizeHex, '0');
+			if (strlen($significant) > 8) {
+				throw new S3AuthException(
+					'InvalidRequest',
+					'Malformed aws-chunked body: chunk size out of range',
+					Http::STATUS_BAD_REQUEST,
+				);
+			}
+
+			$size = $significant === '' ? 0 : (int)hexdec($significant);
+			if ($size > self::MAX_CHUNK_SIZE) {
 				throw new S3AuthException(
 					'InvalidRequest',
 					'Malformed aws-chunked body: chunk size out of range',
@@ -432,9 +475,7 @@ class S3RequestBody {
 			if ($chunkHash !== null) {
 				hash_update($chunkHash, $buf);
 			}
-			if (fwrite($out, $buf) === false) {
-				throw new S3AuthException('InternalError', 'Failed writing request body', Http::STATUS_INTERNAL_SERVER_ERROR);
-			}
+			TempFiles::writeAll($out, $buf);
 			$remaining -= strlen($buf);
 		}
 	}

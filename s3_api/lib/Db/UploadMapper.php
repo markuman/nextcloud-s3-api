@@ -100,6 +100,24 @@ class UploadMapper extends QBMapper {
 	}
 
 	/**
+	 * @return Upload[]
+	 */
+	public function findByBucket(int $bucketId): array {
+		$qb = $this->db->getQueryBuilder();
+		$qb->select('*')
+			->from($this->getTableName())
+			->where($qb->expr()->eq('bucket_id', $qb->createNamedParameter($bucketId, IQueryBuilder::PARAM_INT)));
+		return $this->findEntities($qb);
+	}
+
+	public function deleteByBucket(int $bucketId): void {
+		$qb = $this->db->getQueryBuilder();
+		$qb->delete($this->getTableName())
+			->where($qb->expr()->eq('bucket_id', $qb->createNamedParameter($bucketId, IQueryBuilder::PARAM_INT)));
+		$qb->executeStatement();
+	}
+
+	/**
 	 * Uploads started before `$before`, oldest first, for reaping abandoned
 	 * ones a batch at a time.
 	 *

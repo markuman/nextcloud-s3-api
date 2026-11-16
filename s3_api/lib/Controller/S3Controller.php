@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace OCA\S3Api\Controller;
 
-use OCA\S3Api\Db\BucketMapper;
 use OCA\S3Api\Http\S3ObjectResponse;
 use OCA\S3Api\Service\BodyHash;
 use OCA\S3Api\Service\BucketService;
@@ -31,6 +30,7 @@ use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Files\File;
 use OCP\Files\Folder;
 use OCP\Files\ForbiddenException;
+use OCP\Files\IFilenameValidator;
 use OCP\Files\InvalidPathException;
 use OCP\Files\NotFoundException;
 use OCP\Files\NotPermittedException;
@@ -94,12 +94,19 @@ class S3Controller extends Controller {
 
 	private string $accessKey = '';
 
+	/**
+	 * The query parameters, as S3AuthService parsed them for the signature.
+	 * Request state like $chunkVerifier.
+	 *
+	 * @var array<string, string>
+	 */
+	private array $query = [];
+
 	public function __construct(
 		string $appName,
 		IRequest $request,
 		private S3AuthService $authService,
 		private BucketService $bucketService,
-		private BucketMapper $bucketMapper,
 		private S3ResponseBuilder $responseBuilder,
 		private S3RequestBody $requestBody,
 		private EtagService $etagService,
@@ -107,63 +114,80 @@ class S3Controller extends Controller {
 		private ObjectLockService $objectLock,
 		private TempFiles $tempFiles,
 		private IEventDispatcher $eventDispatcher,
+		private IFilenameValidator $filenameValidator,
 		private LoggerInterface $logger,
 	) {
 		parent::__construct($appName, $request);
 	}
 
+	// The handlers take no parameters, on purpose: the routed `{path}` is
+	// not used. Asking the framework for any parameter makes it decode the
+	// body of a PUT sent as `application/json` or
+	// `application/x-www-form-urlencoded` -- the default of `curl
+	// --data-binary`, and what rclone sends for `.json` files -- and a
+	// `path` in that body replaced the route's. See requestedPath().
+	//
+	// That alone does not keep such a body out of memory: whoever calls
+	// getParam() first triggers the decoding, and the Text app does so
+	// whenever a file is written (DocumentService's constructor), for
+	// WebDAV just the same. A JSON body large enough then ends in a fatal
+	// error in Nextcloud itself; see the README.
+
 	#[PublicPage]
 	#[NoCSRFRequired]
 	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function listBucketsOrRoot(): Response {
-		return $this->handleRequest('');
+		return $this->handleRequest();
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
 	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
-	public function handleGet(string $path = ''): Response {
-		return $this->handleRequest($path);
+	public function handleGet(): Response {
+		return $this->handleRequest();
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
 	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
-	public function handlePut(string $path = ''): Response {
-		return $this->handleRequest($path);
+	public function handlePut(): Response {
+		return $this->handleRequest();
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
 	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
-	public function handleDelete(string $path = ''): Response {
-		return $this->handleRequest($path);
+	public function handleDelete(): Response {
+		return $this->handleRequest();
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
 	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
-	public function handlePost(string $path = ''): Response {
-		return $this->handleRequest($path);
+	public function handlePost(): Response {
+		return $this->handleRequest();
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
 	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
-	public function handleHead(string $path = ''): Response {
-		return $this->handleRequest($path);
+	public function handleHead(): Response {
+		return $this->handleRequest();
 	}
 
 	#[PublicPage]
 	#[NoCSRFRequired]
 	#[BruteForceProtection(action: self::THROTTLE_ACTION)]
 	public function handleHeadRoot(): Response {
-		return $this->handleRequest('');
+		return $this->handleRequest();
 	}
 
-	private function handleRequest(string $path = ''): Response {
+	private function handleRequest(): Response {
+		$requested = $this->requestedPath();
+		// For the error responses' <Resource>.
+		$path = $requested ?? '';
 		try {
-			$response = $this->dispatch($path);
+			$response = $this->dispatch($requested);
 		} catch (S3AuthException $e) {
 			$response = $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
 		} catch (LockedException) {
@@ -209,7 +233,11 @@ class S3Controller extends Controller {
 		return $response;
 	}
 
-	private function dispatch(string $path = ''): Response {
+	/**
+	 * @param string|null $path from requestedPath(): '' for the endpoint
+	 *        itself, null when the URI could not be accounted for
+	 */
+	private function dispatch(?string $path): Response {
 		try {
 			$auth = $this->authService->authenticate($this->request);
 		} catch (S3AuthException $e) {
@@ -224,17 +252,22 @@ class S3Controller extends Controller {
 					'remoteAddress' => $this->request->getRemoteAddress(),
 				]);
 			}
-			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . $path, $e->getHttpStatus());
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), '/' . ($path ?? ''), $e->getHttpStatus());
 		}
 
 		// Set for this request only; the controller is instantiated per request.
 		$this->chunkVerifier = $auth['chunkVerifier'];
 		$this->signedHeaders = $auth['signedHeaders'];
 		$this->accessKey = $auth['accessKey'];
+		$this->query = $auth['query'];
 
 		$userId = $auth['userId'];
 		$permission = $auth['permission'];
 		$method = $this->request->getMethod();
+
+		if ($path === null) {
+			return $this->errorResponse('InvalidURI', "Couldn't parse the specified URI", '/', Http::STATUS_BAD_REQUEST);
+		}
 
 		// Parse bucket and key from path
 		if ($path === '') {
@@ -243,11 +276,6 @@ class S3Controller extends Controller {
 				return $this->listBuckets($userId, $auth['bucketId']);
 			}
 			return $this->errorResponse('MethodNotAllowed', 'Method not allowed', '/', Http::STATUS_METHOD_NOT_ALLOWED);
-		}
-
-		$path = $this->requestedPath($path);
-		if ($path === null) {
-			return $this->errorResponse('InvalidURI', "Couldn't parse the specified URI", '/', Http::STATUS_BAD_REQUEST);
 		}
 		$slashPos = strpos($path, '/');
 		if ($slashPos === false) {
@@ -281,7 +309,7 @@ class S3Controller extends Controller {
 			return $this->errorResponse('NoSuchBucket', 'Bucket folder not found', '/' . $bucketName, Http::STATUS_NOT_FOUND);
 		}
 
-		$query = $this->queryParams();
+		$query = $this->query;
 
 		if ($objectKey === '') {
 			return $this->dispatchBucket($method, $query, $userId, $bucket, $bucketFolder, $bucketName, $permission);
@@ -351,6 +379,13 @@ class S3Controller extends Controller {
 		string $permission,
 	): Response {
 		$resource = '/' . $bucketName . '/' . $objectKey;
+
+		// Everything that can write to the key: PutObject, CopyObject, and
+		// the multipart calls, which store under it in the end. Reads and
+		// deletes still reach a name stored some other way.
+		if ($method === 'PUT' || $method === 'POST') {
+			$this->assertWritableKey($objectKey);
+		}
 
 		// Multipart upload subresources. Without this, `PUT ?partNumber=1` fell
 		// through to PutObject and stored a single part as the whole object,
@@ -428,38 +463,46 @@ class S3Controller extends Controller {
 	}
 
 	/**
-	 * The `bucket/key` the client addressed, with every slash it sent.
+	 * The `bucket/key` the client addressed, with every slash it sent; ''
+	 * for the endpoint itself.
 	 *
-	 * The routed `{path}` has lost some of them: Nextcloud collapses each run
-	 * of slashes in the request URI before routing — a guard against reverse
-	 * proxies that double them — so `a//b` arrives as `a/b`. In S3 those are
-	 * two different keys, and the client signed its request for the first;
-	 * serving the second silently aliases another object, a DELETE included.
-	 * Read from the raw request URI instead, the key keeps its empty segment
-	 * and isUsableKey() refuses it.
+	 * Read from the raw request URI, not from the routed `{path}`. That one
+	 * has lost slashes: Nextcloud collapses each run of them in the request
+	 * URI before routing — a guard against reverse proxies that double them —
+	 * so `a//b` arrives as `a/b`. In S3 those are two different keys, and
+	 * the client signed its request for the first; serving the second
+	 * silently aliases another object, a DELETE included. From the raw URI
+	 * the key keeps its empty segment and isUsableKey() refuses it. And
+	 * asking for the routed parameter would decode some request bodies, see
+	 * the handlers.
 	 *
 	 * Slashes between the endpoint and the bucket are skipped: a client whose
 	 * endpoint is configured with a trailing slash sends `…/s3//bucket/…`, and
-	 * that names no key. The raw path is only used when collapsing it gives
-	 * back exactly what was routed, so the two can differ in collapsed slashes
-	 * and nothing else.
+	 * that names no key.
 	 *
-	 * A request URI of any other shape is refused rather than served from the
-	 * routed path: that path is exactly the one that may have lost a slash,
-	 * so falling back to it would quietly bring the aliasing back the day a
-	 * Nextcloud release or a proxy rewrites URIs in some new way.
+	 * The URI is checked against the path Nextcloud routed by
+	 * (getRawPathInfo(), collapsed the same way): the two may differ in
+	 * collapsed slashes and nothing else. A request URI of any other shape is
+	 * refused rather than guessed at, so the aliasing cannot come back the
+	 * day a Nextcloud release or a proxy rewrites URIs in some new way.
 	 *
 	 * @return string|null null when the request URI does not account for the
 	 *         routed path
 	 */
-	private function requestedPath(string $routed): ?string {
+	private function requestedPath(): ?string {
 		$uri = $this->request->getRequestUri();
 		$query = strpos($uri, '?');
 		if ($query !== false) {
 			$uri = substr($uri, 0, $query);
 		}
 
-		if (preg_match('#/apps/s3_api/s3/+(.+)$#', $uri, $match) !== 1) {
+		try {
+			$routed = $this->request->getRawPathInfo();
+		} catch (\Exception) {
+			$routed = null;
+		}
+
+		if ($routed === null || preg_match('#/apps/s3_api/s3(/.*)?$#', $uri, $match) !== 1) {
 			$this->logger->warning('S3 request URI does not match the routed path', [
 				'app' => 's3_api',
 				'uri' => $uri,
@@ -468,9 +511,9 @@ class S3Controller extends Controller {
 			return null;
 		}
 
-		// Nextcloud collapses first and decodes second; compare the same way,
-		// or an encoded slash next to a literal one would not round-trip.
-		if (rawurldecode((string)preg_replace('#/{2,}#', '/', $match[1])) !== $routed) {
+		$rest = ltrim($match[1] ?? '', '/');
+		$collapsed = '/apps/s3_api/s3/' . preg_replace('#/{2,}#', '/', $rest);
+		if (rtrim($collapsed, '/') !== rtrim($routed, '/')) {
 			$this->logger->warning('S3 request URI does not match the routed path', [
 				'app' => 's3_api',
 				'uri' => $uri,
@@ -479,7 +522,7 @@ class S3Controller extends Controller {
 			return null;
 		}
 
-		return rawurldecode($match[1]);
+		return rawurldecode($rest);
 	}
 
 	/**
@@ -499,35 +542,31 @@ class S3Controller extends Controller {
 	}
 
 	/**
-	 * Query parameters straight from the raw query string.
+	 * Refuse a key whose file or folders Nextcloud would not let a client
+	 * create, before anything is read or created.
 	 *
-	 * parse_str() would rewrite dots in keys and cannot represent a valueless
-	 * parameter such as `?uploads`, which is exactly how subresources are
-	 * expressed.
+	 * Folder::newFile() and newFolder() do not check names; WebDAV calls
+	 * verifyPath() itself before it gets there, and so has to this app.
+	 * Without it the admin's naming rules -- forbidden characters, names,
+	 * extensions, the Windows compatibility mode -- did not apply to S3.
 	 *
-	 * @return array<string, string>
+	 * `.part` is the one that matters most, so it is checked on its own too,
+	 * whatever the configuration: Nextcloud takes a name ending in it for an
+	 * upload in progress, anywhere in the path. The quota wrapper does not
+	 * limit what is written to it, and the file cache never records it, so
+	 * such an object sat on the disk outside the quota and outside every
+	 * listing, the web UI's included -- up to 5 GiB per PUT, as often as a
+	 * key liked.
+	 *
+	 * @throws InvalidPathException
 	 */
-	private function queryParams(): array {
-		$uri = $this->request->getRequestUri();
-		$pos = strpos($uri, '?');
-		if ($pos === false) {
-			return [];
-		}
-
-		$params = [];
-		foreach (explode('&', substr($uri, $pos + 1)) as $pair) {
-			if ($pair === '') {
-				continue;
+	private function assertWritableKey(string $objectKey): void {
+		foreach (explode('/', $objectKey) as $segment) {
+			if (KeyRules::isPartName($segment)) {
+				throw new InvalidPathException('Names ending in .part are reserved');
 			}
-			$eq = strpos($pair, '=');
-			if ($eq === false) {
-				$params[rawurldecode($pair)] = '';
-			} else {
-				$params[rawurldecode(substr($pair, 0, $eq))] = rawurldecode(substr($pair, $eq + 1));
-			}
+			$this->filenameValidator->validateFilename($segment);
 		}
-
-		return $params;
 	}
 
 	/**
@@ -550,7 +589,7 @@ class S3Controller extends Controller {
 	private function listObjects(string $userId, $bucket, Folder $bucketFolder): Response {
 		// Read from the raw query string: getParam() would rewrite dots in keys
 		// such as start-after=wal/dead.beef.pack.
-		$query = $this->queryParams();
+		$query = $this->query;
 
 		$prefix = $query['prefix'] ?? '';
 		$delimiter = $query['delimiter'] ?? '';
@@ -730,21 +769,7 @@ class S3Controller extends Controller {
 		}
 
 		try {
-			// Comparing against a stored ETag hashes the object first if it
-			// has none recorded -- a read of the whole file. Do that before
-			// taking the lock, so the lock is held for the lookup and the
-			// write, not for however long the hash takes; under the lock
-			// get() then finds the record, unless the file changed meanwhile.
-			if ($ifMatch !== '' || ($ifNoneMatch !== '' && $ifNoneMatch !== '*')) {
-				try {
-					$current = $bucketFolder->get($objectKey);
-					if ($current instanceof File) {
-						$this->etagService->get($current);
-					}
-				} catch (NotFoundException) {
-					// Nothing to compare against; the precondition decides.
-				}
-			}
+			$this->prehashTarget($bucketFolder, $objectKey, $ifMatch, $ifNoneMatch);
 
 			$write = fn(): Response => $this->writeObject(
 				$bucketFolder,
@@ -764,7 +789,7 @@ class S3Controller extends Controller {
 			// concurrent `If-None-Match: *` requests both see "absent" and both
 			// succeed -- a silently lost update for a client using this for
 			// compare-and-swap.
-			return $this->objectLock->withLock($bucketFolder, $objectKey, $write);
+			return $this->objectLock->withLock($bucketFolder, $objectKey, $write, fstat($stream)['size'] ?? 0);
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		} catch (LockedException) {
@@ -777,24 +802,97 @@ class S3Controller extends Controller {
 	}
 
 	/**
+	 * Record the target's ETag before a conditional write takes its lock.
+	 *
+	 * Comparing against a stored ETag hashes the object first if it has none
+	 * recorded -- a read of the whole file. Doing that before taking the
+	 * lock keeps the lock held for the lookup and the write, not for however
+	 * long the hash takes; under the lock get() then finds the record,
+	 * unless the file changed meanwhile.
+	 */
+	private function prehashTarget(Folder $bucketFolder, string $objectKey, string $ifMatch, string $ifNoneMatch): void {
+		if ($ifMatch === '' && ($ifNoneMatch === '' || $ifNoneMatch === '*')) {
+			return;
+		}
+
+		try {
+			$current = $bucketFolder->get($objectKey);
+			if ($current instanceof File) {
+				$this->etagService->get($current);
+			}
+		} catch (NotFoundException) {
+			// Nothing to compare against; the precondition decides.
+		}
+	}
+
+	/**
+	 * The file a key names now, or null when there is none.
+	 *
+	 * @throws S3AuthException when the key names a folder
+	 */
+	private function targetFile(Folder $bucketFolder, string $objectKey): ?File {
+		try {
+			$node = $bucketFolder->get($objectKey);
+		} catch (NotFoundException) {
+			return null;
+		}
+
+		if (!($node instanceof File)) {
+			throw new S3AuthException('InvalidArgument', 'Target exists and is not a file', Http::STATUS_CONFLICT);
+		}
+
+		return $node;
+	}
+
+	/**
+	 * Run a write under the object's lock when it carries a precondition,
+	 * after evaluating that against the target as it is under the lock.
+	 *
+	 * @template T
+	 * @param \Closure(?File): T $write gets the current target
+	 * @param int|float $writeBytes how much `$write` stores, so the lock is
+	 *        held long enough for it (ObjectLockService::WRITE_RATE_FLOOR)
+	 * @return T
+	 * @throws S3AuthException PreconditionFailed
+	 */
+	private function writeIfPreconditionsHold(Folder $bucketFolder, string $objectKey, string $ifMatch, string $ifNoneMatch, int|float $writeBytes, \Closure $write) {
+		if ($ifMatch === '' && $ifNoneMatch === '') {
+			return $write($this->targetFile($bucketFolder, $objectKey));
+		}
+
+		return $this->objectLock->withLock($bucketFolder, $objectKey, function () use ($bucketFolder, $objectKey, $ifMatch, $ifNoneMatch, $write) {
+			$existing = $this->targetFile($bucketFolder, $objectKey);
+			if ($this->writePreconditionFails($existing, $ifMatch, $ifNoneMatch)) {
+				throw $this->preconditionFailed();
+			}
+			return $write($existing);
+		}, $writeBytes);
+	}
+
+	private function preconditionFailed(): S3AuthException {
+		return new S3AuthException('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', Http::STATUS_PRECONDITION_FAILED);
+	}
+
+	/**
 	 * Read an upload body into a temp stream and check every integrity claim
 	 * the request makes about it: a literal payload hash, `Content-MD5`,
 	 * `x-amz-checksum-*` as header or trailer (see PayloadIntegrity). S3
 	 * answers a mismatch with BadDigest, and clients rely on that: a checksum
 	 * they signed is all that ties an `UNSIGNED-PAYLOAD` body to the request.
 	 *
-	 * Bounded twice before the body reaches the temp directory: by what one
-	 * request may carry at all, and by the free space where it is going to
-	 * be stored. Nextcloud's quota only applies once the bytes are stored,
-	 * which is after they have all been written to the temp directory --
-	 * shared by every user of the instance.
+	 * Bounded three times before the body reaches the temp directory: by
+	 * what one request may carry at all, by the free space where it is going
+	 * to be stored, and by the free space in the temp directory itself.
+	 * Nextcloud's quota only applies once the bytes are stored, which is
+	 * after they have all been written to the temp directory -- shared by
+	 * every user of the instance.
 	 *
 	 * @return resource rewound, owned by the caller
 	 * @throws S3AuthException
 	 */
 	private function readUploadBody(Folder $target) {
 		$limit = self::MAX_OBJECT_BYTES;
-		$quotaBound = false;
+		$boundBy = 'request';
 		try {
 			$free = $target->getFreeSpace();
 		} catch (\Throwable) {
@@ -803,7 +901,12 @@ class S3Controller extends Controller {
 		// Negative values mean unknown or unlimited.
 		if ((is_int($free) || is_float($free)) && $free >= 0 && $free < $limit) {
 			$limit = (int)$free;
-			$quotaBound = true;
+			$boundBy = 'quota';
+		}
+		$tempFree = $this->tempFiles->freeSpace();
+		if ($tempFree !== null && $tempFree < $limit) {
+			$limit = $tempFree;
+			$boundBy = 'temp';
 		}
 
 		$hash = new BodyHash(PayloadIntegrity::algorithms($this->request, true));
@@ -811,9 +914,16 @@ class S3Controller extends Controller {
 		try {
 			$stream = $this->requestBody->toStream($this->request, $hash, $this->chunkVerifier, $limit, $trailers);
 		} catch (S3AuthException $e) {
-			if ($e->getS3Code() === 'EntityTooLarge' && $quotaBound) {
+			if ($e->getS3Code() === 'EntityTooLarge' && $boundBy === 'quota') {
 				// The same answer a full quota gets from Nextcloud itself.
 				throw new S3AuthException('AccessDenied', 'Not enough free space for this upload', Http::STATUS_FORBIDDEN);
+			}
+			if ($e->getS3Code() === 'EntityTooLarge' && $boundBy === 'temp') {
+				$this->logger->warning('S3 upload refused: the temp directory is out of space', [
+					'app' => 's3_api',
+					'free' => $tempFree,
+				]);
+				throw new S3AuthException('EntityTooLarge', 'Not enough temporary space on the server for this upload', Http::STATUS_BAD_REQUEST);
 			}
 			throw $e;
 		}
@@ -919,6 +1029,8 @@ class S3Controller extends Controller {
 			return $precondition;
 		}
 
+		$size = fstat($stream)['size'] ?? null;
+
 		// Hand the stream to Nextcloud rather than writing through fopen():
 		// putContent() copies it under an exclusive lock and updates the file
 		// cache, so size and ETag reflect the new content. Writing to the raw
@@ -934,6 +1046,9 @@ class S3Controller extends Controller {
 		$file = $targetFolder->get($fileName);
 		if (!($file instanceof File)) {
 			return $this->errorResponse('InternalError', 'Object vanished after write', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
+		}
+		if ($size !== null) {
+			$this->assertStoredSize($file, $size);
 		}
 
 		$response = new DataDisplayResponse('');
@@ -953,26 +1068,99 @@ class S3Controller extends Controller {
 	 * @return Response|null a 412 response, or null when the write may proceed
 	 */
 	private function checkWritePreconditions(?File $existing, string $resource, string $ifMatch, string $ifNoneMatch): ?Response {
-		if ($ifMatch !== '') {
-			if ($existing === null) {
-				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
-			}
-			if (!$this->etagMatches($ifMatch, $this->etagService->get($existing))) {
-				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
-			}
-		}
-
-		if ($ifNoneMatch !== '') {
-			if ($ifNoneMatch === '*') {
-				if ($existing !== null) {
-					return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
-				}
-			} elseif ($existing !== null && $this->etagMatches($ifNoneMatch, $this->etagService->get($existing))) {
-				return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
-			}
+		if ($this->writePreconditionFails($existing, $ifMatch, $ifNoneMatch)) {
+			return $this->errorResponse('PreconditionFailed', 'At least one of the pre-conditions you specified did not hold', $resource, Http::STATUS_PRECONDITION_FAILED);
 		}
 
 		return null;
+	}
+
+	private function writePreconditionFails(?File $existing, string $ifMatch, string $ifNoneMatch): bool {
+		if ($ifMatch !== '') {
+			if ($existing === null || !$this->etagMatches($ifMatch, $this->etagService->get($existing))) {
+				return true;
+			}
+		}
+
+		if ($ifNoneMatch !== '' && $existing !== null) {
+			if ($ifNoneMatch === '*' || $this->etagMatches($ifNoneMatch, $this->etagService->get($existing))) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * `x-amz-copy-source-if-*`: whether the source is the one the copy is
+	 * meant for. Evaluated as RFC 9110 has it, which gives S3's documented
+	 * results for the combinations: a matching If-Match overrides
+	 * If-Unmodified-Since, a present If-None-Match overrides
+	 * If-Modified-Since. A date that does not parse is ignored.
+	 */
+	private function copySourcePreconditionsHold(File $source): bool {
+		$ifMatch = trim((string)$this->request->getHeader('x-amz-copy-source-if-match'));
+		$ifNoneMatch = trim((string)$this->request->getHeader('x-amz-copy-source-if-none-match'));
+		$ifUnmodifiedSince = $this->httpDate((string)$this->request->getHeader('x-amz-copy-source-if-unmodified-since'));
+		$ifModifiedSince = $this->httpDate((string)$this->request->getHeader('x-amz-copy-source-if-modified-since'));
+
+		if ($ifMatch !== '') {
+			if (!$this->etagMatches($ifMatch, $this->etagService->get($source))) {
+				return false;
+			}
+		} elseif ($ifUnmodifiedSince !== null && $source->getMTime() > $ifUnmodifiedSince) {
+			return false;
+		}
+
+		if ($ifNoneMatch !== '') {
+			if ($this->etagMatches($ifNoneMatch, $this->etagService->get($source))) {
+				return false;
+			}
+		} elseif ($ifModifiedSince !== null && $source->getMTime() <= $ifModifiedSince) {
+			return false;
+		}
+
+		return true;
+	}
+
+	private function httpDate(string $value): ?int {
+		$value = trim($value);
+		if ($value === '') {
+			return null;
+		}
+		$time = strtotime($value);
+		return $time === false ? null : $time;
+	}
+
+	/**
+	 * Fail a write that did not store what it was given.
+	 *
+	 * Every step on the way can lose bytes without saying so -- a short read
+	 * from a storage, a short write to a full disk -- and the client would
+	 * get 200 for a truncated object. The bytes are gone by now, but the
+	 * client learns it and can try again.
+	 *
+	 * The size is read back from the file, and an unconditional write holds
+	 * no lock: another request that writes the same key in between makes
+	 * the sizes differ just the same, though nothing went missing. The
+	 * client retries either way, so that one costs a retry and no data; the
+	 * log says it can be either, at warning level.
+	 *
+	 * @throws S3AuthException
+	 */
+	private function assertStoredSize(File $file, int|float $expected): void {
+		$stored = $file->getSize();
+		if ((int)$stored === (int)$expected) {
+			return;
+		}
+
+		$this->logger->warning('S3 write: the stored file has a different size than this request wrote -- a short read or write, or another request wrote the same key meanwhile', [
+			'app' => 's3_api',
+			'path' => $file->getPath(),
+			'expected' => $expected,
+			'stored' => $stored,
+		]);
+		throw new S3AuthException('InternalError', 'The object could not be confirmed as stored completely, please retry', Http::STATUS_INTERNAL_SERVER_ERROR);
 	}
 
 	/**
@@ -1076,14 +1264,14 @@ class S3Controller extends Controller {
 		}
 
 		try {
-			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
+			$upload = $this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
 
 			// Parts are stored in the bucket's scratch area, so the bucket's
 			// free space is what bounds them.
 			$stream = $this->readUploadBody($bucketFolder);
 
 			try {
-				$etag = $this->multipartService->putPart($bucketFolder, $uploadId, (int)$partNumber, $stream);
+				$etag = $this->multipartService->putPart($bucketFolder, $upload, (int)$partNumber, $stream, (int)fstat($stream)['size']);
 			} finally {
 				if (is_resource($stream)) {
 					fclose($stream);
@@ -1114,6 +1302,11 @@ class S3Controller extends Controller {
 			return $this->errorResponse('AccessDenied', 'Write access denied', $resource, Http::STATUS_FORBIDDEN);
 		}
 
+		// Conditional writes as on PutObject: S3 takes them here too, and a
+		// client that relies on them must not get 200 for an update it lost.
+		$ifMatch = trim((string)$this->request->getHeader('If-Match'));
+		$ifNoneMatch = trim((string)$this->request->getHeader('If-None-Match'));
+
 		try {
 			$upload = $this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
 
@@ -1124,17 +1317,39 @@ class S3Controller extends Controller {
 				return $this->errorResponse('MalformedXML', 'The XML you provided was not well-formed', $resource, Http::STATUS_BAD_REQUEST);
 			}
 
+			$this->prehashTarget($bucketFolder, $objectKey, $ifMatch, $ifNoneMatch);
+
+			// Checked once now, without the lock, so a request that is bound
+			// to fail does not first copy the whole object into the temp
+			// directory; and again under the lock once it is assembled, right
+			// before it is stored, so the lock is not held for that copy. A
+			// failed condition leaves the upload as it was, as on S3.
+			if ($this->writePreconditionFails($this->targetFile($bucketFolder, $objectKey), $ifMatch, $ifNoneMatch)) {
+				throw $this->preconditionFailed();
+			}
+
 			$result = $this->multipartService->complete(
 				$bucketFolder,
 				$upload,
 				$requested,
-				fn($assembled) => $this->writeAssembledObject($bucketFolder, $objectKey, $assembled),
+				fn($assembled, int|float $size, string $etag): File => $this->writeIfPreconditionsHold(
+					$bucketFolder,
+					$objectKey,
+					$ifMatch,
+					$ifNoneMatch,
+					$size,
+					function () use ($bucketFolder, $objectKey, $assembled, $size, $etag): File {
+						$file = $this->writeAssembledObject($bucketFolder, $objectKey, $assembled, $size);
+						// Record the compound ETag, otherwise the next read
+						// would replace it with a plain content hash and the
+						// value would change without the object changing.
+						// Under the lock, so a conditional writer never
+						// compares against the content hash in between.
+						$this->etagService->set($file, $etag);
+						return $file;
+					},
+				),
 			);
-
-			// Record the compound ETag, otherwise the next read would replace it
-			// with a plain content hash and the value would change without the
-			// object changing.
-			$this->etagService->set($result['file'], $result['etag']);
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
 		} catch (LockedException) {
@@ -1266,8 +1481,10 @@ class S3Controller extends Controller {
 	 * Write the assembled multipart object, creating parent folders.
 	 *
 	 * @param resource $assembled
+	 * @param int|float $size what `$assembled` holds, checked against what
+	 *        is stored
 	 */
-	private function writeAssembledObject(Folder $bucketFolder, string $objectKey, $assembled): File {
+	private function writeAssembledObject(Folder $bucketFolder, string $objectKey, $assembled, int|float $size): File {
 		$targetFolder = $this->ensureParentFolder($bucketFolder, $objectKey);
 		$fileName = basename($objectKey);
 
@@ -1295,6 +1512,7 @@ class S3Controller extends Controller {
 		if (!($reread instanceof File)) {
 			throw new S3AuthException('InternalError', 'Object vanished after write', Http::STATUS_INTERNAL_SERVER_ERROR);
 		}
+		$this->assertStoredSize($reread, $size);
 
 		return $reread;
 	}
@@ -1405,43 +1623,47 @@ class S3Controller extends Controller {
 			return $this->errorResponse('NoSuchKey', 'The copy source is not a file', $resource, Http::STATUS_NOT_FOUND);
 		}
 
-		if ($this->isSameFile($bucketFolder, $objectKey, $source)) {
-			// A self-copy would truncate the source before reading it.
-			return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($this->etagService->get($source), $source->getMTime()));
-		}
-
-		$handle = $source->fopen('rb');
-		if ($handle === false) {
-			return $this->errorResponse('InternalError', 'Cannot read copy source', $resource, Http::STATUS_INTERNAL_SERVER_ERROR);
-		}
+		// Conditions on the target, as on PutObject.
+		$ifMatch = trim((string)$this->request->getHeader('If-Match'));
+		$ifNoneMatch = trim((string)$this->request->getHeader('If-None-Match'));
 
 		try {
-			$file = $this->writeAssembledObject($bucketFolder, $objectKey, $handle);
-		} finally {
-			if (is_resource($handle)) {
-				fclose($handle);
+			if (!$this->copySourcePreconditionsHold($source)) {
+				throw $this->preconditionFailed();
 			}
+
+			$this->prehashTarget($bucketFolder, $objectKey, $ifMatch, $ifNoneMatch);
+
+			$result = $this->writeIfPreconditionsHold($bucketFolder, $objectKey, $ifMatch, $ifNoneMatch, $source->getSize(), function (?File $existing) use ($bucketFolder, $objectKey, $source): array {
+				// Same file by id, not by comparing the keys: two spellings
+				// can reach one file -- on a case-insensitive storage such
+				// as an SMB mount, `A` and `a` do. A self-copy would truncate
+				// the source before reading it.
+				if ($existing !== null && $existing->getId() === $source->getId()) {
+					return [$this->etagService->get($source), $source->getMTime()];
+				}
+
+				$handle = $source->fopen('rb');
+				if ($handle === false) {
+					throw new S3AuthException('InternalError', 'Cannot read copy source', Http::STATUS_INTERNAL_SERVER_ERROR);
+				}
+				try {
+					$file = $this->writeAssembledObject($bucketFolder, $objectKey, $handle, $source->getSize());
+				} finally {
+					if (is_resource($handle)) {
+						fclose($handle);
+					}
+				}
+
+				return [$this->etagService->refresh($file), $file->getMTime()];
+			});
+		} catch (S3AuthException $e) {
+			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		} catch (LockedException) {
+			return $this->errorResponse('SlowDown', 'The object is locked by another operation, please retry', $resource, Http::STATUS_SERVICE_UNAVAILABLE);
 		}
 
-		return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($this->etagService->refresh($file), $file->getMTime()));
-	}
-
-	/**
-	 * Whether `$objectKey` names the file `$source` is.
-	 *
-	 * Decided by file id, not by comparing the keys: two spellings can reach
-	 * one file -- on a case-insensitive storage such as an SMB mount, `A` and
-	 * `a` do -- and a string comparison would let such a copy open the
-	 * source for reading and then truncate it for writing.
-	 */
-	private function isSameFile(Folder $bucketFolder, string $objectKey, File $source): bool {
-		try {
-			$target = $bucketFolder->get($objectKey);
-		} catch (NotFoundException) {
-			return false;
-		}
-
-		return $target->getId() === $source->getId();
+		return $this->xmlResponse($this->responseBuilder->copyObjectResultXml($result[0], $result[1]));
 	}
 
 	/**
@@ -1474,7 +1696,7 @@ class S3Controller extends Controller {
 		}
 
 		try {
-			$this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
+			$upload = $this->multipartService->get($uploadId, $bucket->getId(), $objectKey);
 
 			$source = $bucketFolder->get($sourceKey);
 			if (!($source instanceof File)) {
@@ -1490,9 +1712,29 @@ class S3Controller extends Controller {
 				return $this->errorResponse('InvalidArgument', 'The x-amz-copy-source-range is not satisfiable', $resource, Http::STATUS_BAD_REQUEST);
 			}
 
+			if (!$this->copySourcePreconditionsHold($source)) {
+				throw $this->preconditionFailed();
+			}
+
+			// The same bounds as a part sent in the body: 5 GiB, as on S3,
+			// and the bucket's free space, where the part is stored. A range
+			// is cut out into the temp directory first, so it has to fit
+			// there as well.
+			$length = $range === null ? $size : $range[1] - $range[0] + 1;
+			if ($length > self::MAX_OBJECT_BYTES) {
+				return $this->errorResponse('InvalidRequest', 'The specified copy source is larger than the maximum allowable size for a copy source: ' . self::MAX_OBJECT_BYTES, $resource, Http::STATUS_BAD_REQUEST);
+			}
+			$free = $bucketFolder->getFreeSpace();
+			if ((is_int($free) || is_float($free)) && $free >= 0 && $length > $free) {
+				return $this->errorResponse('AccessDenied', 'Not enough free space for this upload', $resource, Http::STATUS_FORBIDDEN);
+			}
+			if ($range !== null) {
+				$this->tempFiles->assertRoomFor($length);
+			}
+
 			$slice = $this->sliceOf($source, $range);
 			try {
-				$etag = $this->multipartService->putPart($bucketFolder, $uploadId, (int)$partNumber, $slice);
+				$etag = $this->multipartService->putPart($bucketFolder, $upload, (int)$partNumber, $slice, (int)$length);
 			} finally {
 				if (is_resource($slice)) {
 					fclose($slice);
@@ -1502,6 +1744,8 @@ class S3Controller extends Controller {
 			return $this->errorResponse('NoSuchKey', 'The specified copy source does not exist', $resource, Http::STATUS_NOT_FOUND);
 		} catch (S3AuthException $e) {
 			return $this->errorResponse($e->getS3Code(), $e->getMessage(), $resource, $e->getHttpStatus());
+		} catch (LockedException) {
+			return $this->errorResponse('SlowDown', 'The upload is locked by another operation, please retry', $resource, Http::STATUS_SERVICE_UNAVAILABLE);
 		}
 
 		return $this->xmlResponse($this->responseBuilder->copyPartResultXml($etag, time()));
@@ -1581,8 +1825,13 @@ class S3Controller extends Controller {
 	/**
 	 * A stream over `$range` of `$file`, or the whole file when null.
 	 *
+	 * A range is copied out into a temp file, and every byte of it has to
+	 * arrive: a source that ends early, or a temp directory that fills up,
+	 * fails the request instead of storing a shorter part.
+	 *
 	 * @param array{0: int, 1: int}|null $range
 	 * @return resource
+	 * @throws S3AuthException
 	 */
 	private function sliceOf(File $file, ?array $range) {
 		$handle = $file->fopen('rb');
@@ -1601,20 +1850,34 @@ class S3Controller extends Controller {
 			throw $e;
 		}
 
+		$short = new S3AuthException('InternalError', 'The copy source ended before the requested range', Http::STATUS_INTERNAL_SERVER_ERROR);
 		try {
-			if ($range[0] > 0) {
-				fseek($handle, $range[0]);
+			// Some storages only stream and cannot seek: skip forward by
+			// reading, as S3ObjectResponse does. Copying from offset 0
+			// instead would store the wrong bytes.
+			if ($range[0] > 0 && fseek($handle, $range[0]) !== 0) {
+				$skipped = 0;
+				while ($skipped < $range[0]) {
+					$buf = fread($handle, (int)min(1024 * 1024, $range[0] - $skipped));
+					if ($buf === false || $buf === '') {
+						throw $short;
+					}
+					$skipped += strlen($buf);
+				}
 			}
 
 			$remaining = $range[1] - $range[0] + 1;
-			while ($remaining > 0 && !feof($handle)) {
+			while ($remaining > 0) {
 				$buf = fread($handle, (int)min(1024 * 1024, $remaining));
 				if ($buf === false || $buf === '') {
-					break;
+					throw $short;
 				}
-				fwrite($out, $buf);
+				TempFiles::writeAll($out, $buf);
 				$remaining -= strlen($buf);
 			}
+		} catch (\Throwable $e) {
+			fclose($out);
+			throw $e;
 		} finally {
 			fclose($handle);
 		}

@@ -123,3 +123,24 @@ def test_boto3_put_object(boto_factory, s3, bucket, prefix, checksums):
     data = os.urandom(100_000)
     client.put_object(Bucket=bucket, Key=prefix + "obj", Body=data)
     assert s3.get(bucket, prefix + "obj").body == data
+
+
+def put_framed(s3, bucket, key, body, decoded):
+    return s3.request("PUT", bucket, key, body, payload_hash="STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                      headers={"Content-Encoding": "aws-chunked", "x-amz-decoded-content-length": str(decoded)})
+
+
+@pytest.mark.parametrize("size", [b"10000000000000000", b"ffffffffffffffffffff", b"100000000"])
+def test_chunk_size_out_of_range(s3, bucket, prefix, size):
+    """Past 16 hex digits PHP's int conversion is undefined, and 0 -- the
+    final chunk -- is among its results. Refused before converting."""
+    r = put_framed(s3, bucket, prefix + "obj", size + b"\r\nx\r\n0\r\n\r\n", 1)
+    assert r.status == 400
+    assert r.error_code == "InvalidRequest"
+    assert s3.get(bucket, prefix + "obj").status == 404
+
+
+def test_chunk_size_with_leading_zeros(s3, bucket, prefix):
+    r = put_framed(s3, bucket, prefix + "obj", b"00000000000000000000004\r\nabcd\r\n0\r\n\r\n", 4)
+    assert r.status == 200, r.body
+    assert s3.get(bucket, prefix + "obj").body == b"abcd"

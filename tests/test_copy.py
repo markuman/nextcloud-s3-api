@@ -1,5 +1,7 @@
 """CopyObject."""
+import email.utils
 import hashlib
+import time
 import urllib.parse
 
 import pytest
@@ -82,3 +84,57 @@ def test_copy_via_boto3(boto, s3, bucket, prefix):
     s3.put(bucket, prefix + "src", b"boto")
     boto.copy_object(Bucket=bucket, Key=prefix + "dst", CopySource={"Bucket": bucket, "Key": prefix + "src"})
     assert s3.get(bucket, prefix + "dst").body == b"boto"
+
+
+def http_date(t):
+    return email.utils.formatdate(t, usegmt=True)
+
+
+@pytest.mark.parametrize("header,value,copies", [
+    ("x-amz-copy-source-if-match", "{etag}", True),
+    ("x-amz-copy-source-if-match", '"0123"', False),
+    ("x-amz-copy-source-if-none-match", "{etag}", False),
+    ("x-amz-copy-source-if-none-match", '"0123"', True),
+    ("x-amz-copy-source-if-modified-since", "{future}", False),
+    ("x-amz-copy-source-if-modified-since", "{past}", True),
+    ("x-amz-copy-source-if-unmodified-since", "{past}", False),
+    ("x-amz-copy-source-if-unmodified-since", "{future}", True),
+])
+def test_copy_source_conditions(s3, bucket, prefix, header, value, copies):
+    """Up to 1.7.2 these were ignored: a copy meant for one version of the
+    source copied whatever was there."""
+    etag = s3.put(bucket, prefix + "src", b"payload").etag
+    value = value.format(etag=etag, future=http_date(time.time() + 3600), past=http_date(946684800))
+    r = s3.put(bucket, prefix + "dst", headers={"x-amz-copy-source": f"{bucket}/{prefix}src", header: value})
+    if copies:
+        assert r.status == 200, r.body
+        assert s3.get(bucket, prefix + "dst").body == b"payload"
+    else:
+        assert r.status == 412
+        assert r.error_code == "PreconditionFailed"
+        assert s3.get(bucket, prefix + "dst").status == 404
+
+
+def test_copy_honours_conditions_on_the_target(s3, bucket, prefix):
+    """If-Match / If-None-Match on the target, as on PutObject. Up to 1.7.2
+    ignored: a compare-and-swap client got 200 for an update it lost."""
+    s3.put(bucket, prefix + "src", b"new")
+    old = s3.put(bucket, prefix + "dst", b"old").etag
+    source = {"x-amz-copy-source": f"{bucket}/{prefix}src"}
+
+    for condition in ({"If-None-Match": "*"}, {"If-Match": '"0123"'}, {"If-None-Match": old}):
+        r = s3.put(bucket, prefix + "dst", headers={**source, **condition})
+        assert r.status == 412, condition
+        assert r.error_code == "PreconditionFailed"
+        assert s3.get(bucket, prefix + "dst").body == b"old"
+
+    assert s3.put(bucket, prefix + "dst", headers={**source, "If-Match": old}).status == 200
+    assert s3.get(bucket, prefix + "dst").body == b"new"
+    assert s3.put(bucket, prefix + "fresh", headers={**source, "If-None-Match": "*"}).status == 200
+    assert s3.get(bucket, prefix + "fresh").body == b"new"
+
+
+def test_self_copy_with_if_none_match_fails(s3, bucket, prefix):
+    s3.put(bucket, prefix + "obj", b"keep")
+    r = s3.put(bucket, prefix + "obj", headers={"x-amz-copy-source": f"{bucket}/{prefix}obj", "If-None-Match": "*"})
+    assert r.status == 412

@@ -1,10 +1,12 @@
 """Multipart uploads, UploadPartCopy and the scratch area."""
 import hashlib
 import os
+import secrets
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from botocore.exceptions import ClientError
-from s3client import NS
+from s3client import NS, S3Client
 
 MiB = 1024 * 1024
 
@@ -279,12 +281,18 @@ def test_list_uploads_pages(boto, bucket, prefix):
             boto.abort_multipart_upload(Bucket=bucket, Key=k, UploadId=i)
 
 
+def fake_uploads(sql, bucket_id, prefix, created_at, n=1000):
+    """`n` upload rows without parts, in one statement any database takes."""
+    params = []
+    for i in range(n):
+        params += [f"{i:032x}", bucket_id, f"{prefix}fake{i}", "admin", created_at]
+    sql("INSERT INTO oc_s3api_uploads (upload_id, bucket_id, object_key, user_id, created_at) VALUES "
+        + ", ".join(["(?, ?, ?, ?, ?)"] * n), *params)
+
+
 def test_uploads_in_flight_are_capped(s3, sql, env, bucket, prefix):
     """Every upload is a row and a folder until it is finished or a week old."""
-    sql("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 999)"
-        " INSERT INTO oc_s3api_uploads (upload_id, bucket_id, object_key, user_id, created_at)"
-        " SELECT printf('%032x', i), ?, ? || 'fake' || i, 'admin', '2030-01-01 00:00:00' FROM n",
-        env.main.id, prefix)
+    fake_uploads(sql, env.main.id, prefix, "2030-01-01 00:00:00")
     try:
         r = s3.request("POST", bucket, prefix + "one-more", query={"uploads": ""}, raw_query="uploads")
         assert r.status == 400
@@ -297,10 +305,7 @@ def test_expired_uploads_make_room_at_the_cap(s3, sql, env, bucket, prefix):
     """A client that crashed through a thousand uploads must not lock the
     bucket for the days the cleanup job takes: once they are past their age,
     a new upload clears some away itself."""
-    sql("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 999)"
-        " INSERT INTO oc_s3api_uploads (upload_id, bucket_id, object_key, user_id, created_at)"
-        " SELECT printf('%032x', i), ?, ? || 'fake' || i, 'admin', '2000-01-01 00:00:00' FROM n",
-        env.main.id, prefix)
+    fake_uploads(sql, env.main.id, prefix, "2000-01-01 00:00:00")
     try:
         r = s3.request("POST", bucket, prefix + "one-more", query={"uploads": ""}, raw_query="uploads")
         assert r.status == 200, r.body
@@ -309,3 +314,166 @@ def test_expired_uploads_make_room_at_the_cap(s3, sql, env, bucket, prefix):
         s3.request("DELETE", bucket, prefix + "one-more", query={"uploadId": r.xml().findtext(f"{NS}UploadId")})
     finally:
         sql("DELETE FROM oc_s3api_uploads WHERE object_key LIKE ?", prefix + "fake%")
+
+
+# ---- 1.7.3 ------------------------------------------------------------------
+
+def test_first_parts_in_parallel(boto, bucket, upload):
+    """SDKs send the first parts at once. Up to 1.7.2 each of them created
+    the upload's folder, and Nextcloud refused the losers with a 403 that no
+    client retries; the folder is made with the upload now."""
+    key, upload_id = upload
+    with ThreadPoolExecutor(8) as pool:
+        etags = list(pool.map(lambda n: put_part(boto, bucket, key, upload_id, n, b"part %d" % n), range(1, 9)))
+    assert etags == [f'"{hashlib.md5(b"part %d" % n).hexdigest()}"' for n in range(1, 9)]
+
+
+@pytest.mark.parametrize("condition", [{"IfNoneMatch": "*"}, {"IfMatch": '"0123"'}])
+def test_complete_honours_conditions(boto, s3, bucket, upload, condition):
+    """Up to 1.7.2 ignored. A failed condition leaves the upload as it was,
+    as on S3, so it can still be completed or aborted."""
+    key, upload_id = upload
+    s3.put(bucket, key, b"current")
+    etag = put_part(boto, bucket, key, upload_id, 1, b"replacement")
+    parts = {"Parts": [{"PartNumber": 1, "ETag": etag}]}
+
+    with pytest.raises(ClientError) as e:
+        boto.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload=parts, **condition)
+    assert error_code(e) == "PreconditionFailed"
+    assert s3.get(bucket, key).body == b"current"
+
+    current = s3.head(bucket, key).etag
+    boto.complete_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id, MultipartUpload=parts, IfMatch=current)
+    assert s3.get(bucket, key).body == b"replacement"
+
+
+def test_compound_etag_works_for_compare_and_swap(boto, s3, sql, bucket, upload):
+    """What gits3 relies on: the ETag CompleteMultipartUpload returns is the
+    object's version from then on, also for a row recorded before 1.7.3 --
+    without Nextcloud's etag -- which is completed on first read."""
+    key, upload_id = upload
+    etag = put_part(boto, bucket, key, upload_id, 1, b"tail")
+    out = complete(boto, bucket, key, upload_id, [(1, etag)])
+    compound = out["ETag"]
+
+    sql("UPDATE oc_s3api_etags SET nc_etag = NULL WHERE etag = ?", compound.strip('"'))
+    assert s3.head(bucket, key).etag == compound
+    assert sql("SELECT COUNT(*) AS n FROM oc_s3api_etags WHERE etag = ? AND nc_etag IS NULL", compound.strip('"')) == [{"n": 0}]
+    assert s3.head(bucket, key).etag == compound
+    assert s3.put(bucket, key, b"next", headers={"If-Match": compound}).status == 200
+
+
+def test_upload_part_copy_source_condition(boto, s3, bucket, upload, prefix):
+    key, upload_id = upload
+    s3.put(bucket, prefix + "src", b"source")
+    with pytest.raises(ClientError) as e:
+        boto.upload_part_copy(Bucket=bucket, Key=key, UploadId=upload_id, PartNumber=1,
+                              CopySource={"Bucket": bucket, "Key": prefix + "src"}, CopySourceIfMatch='"0123"')
+    assert error_code(e) == "PreconditionFailed"
+
+
+def test_scratch_folder_of_another_user_is_not_used(make_user, nc_bob, env):
+    """A bucket on the home folder, and someone shares a folder named
+    `.s3-uploads` with its owner: up to 1.7.2 the parts went into that
+    share, to its owner, and pruning would have deleted it."""
+    from test_bucket import share_with, unshare
+    owner = make_user()
+    trap = f"s3t-{env.run_id}-trap-{secrets.token_hex(2)}"
+    nc_bob.mkcol(trap)
+    nc_bob.mkcol(f"{trap}/.s3-uploads")
+    share_id, target = share_with(nc_bob, f"{trap}/.s3-uploads", owner)
+    try:
+        assert target == ".s3-uploads"
+        b = owner.create_bucket("/", f"home-{secrets.token_hex(3)}")
+        k = owner.create_key(b["id"])
+        client = S3Client(env.endpoint, k["accessKey"], k["secretKey"])
+
+        r = client.request("POST", b["bucketName"], "big.bin", query={"uploads": ""}, raw_query="uploads")
+        assert r.status == 403
+        assert r.error_code == "AccessDenied"
+        assert client.put(b["bucketName"], "plain", b"still works").status == 200
+        assert nc_bob.exists(f"{trap}/.s3-uploads")
+        listing = nc_bob.http("PROPFIND", nc_bob.dav_path(f"{trap}/.s3-uploads"), headers={"Depth": "1"})
+        assert listing.body.count(b"<d:response>") == 1
+    finally:
+        unshare(nc_bob, share_id)
+        nc_bob.remove(trap)
+
+
+def test_deleting_a_bucket_drops_its_uploads(nc, sql, env):
+    """Up to 1.7.2 the parts stayed in the folder, and the cleanup job could
+    not find them any more once the bucket record was gone."""
+    folder = f"s3t-{env.run_id}-del-{secrets.token_hex(2)}"
+    nc.mkcol(folder)
+    b = nc.create_bucket("/" + folder, f"del-{secrets.token_hex(3)}")
+    k = nc.create_key(b["id"])
+    client = S3Client(env.endpoint, k["accessKey"], k["secretKey"])
+    r = client.request("POST", b["bucketName"], "big.bin", query={"uploads": ""}, raw_query="uploads")
+    upload_id = r.xml().findtext(f"{NS}UploadId")
+    assert client.put(b["bucketName"], "big.bin", b"part", query={"uploadId": upload_id, "partNumber": "1"}).status == 200
+    assert nc.exists(f"{folder}/.s3-uploads")
+
+    assert nc.api("DELETE", f"/buckets/{b['id']}").status == 200
+    assert not nc.exists(f"{folder}/.s3-uploads")
+    assert sql("SELECT COUNT(*) AS n FROM oc_s3api_uploads WHERE bucket_id = ?", b["id"]) == [{"n": 0}]
+
+
+def start_upload(client, bucket, key, data):
+    r = client.request("POST", bucket, key, query={"uploads": ""}, raw_query="uploads")
+    assert r.status == 200, r.body
+    upload_id = r.xml().findtext(f"{NS}UploadId")
+    r = client.put(bucket, key, data, query={"uploadId": upload_id, "partNumber": "1"})
+    assert r.status == 200, r.body
+    return upload_id, r.etag
+
+
+def complete_body(etag):
+    return f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>".encode()
+
+
+@pytest.fixture
+def shared_buckets(nc, nc_bob, env):
+    """One folder of admin's, shared with bob, a bucket on it for each."""
+    from test_bucket import share_with, unshare
+    folder = f"s3t-{env.run_id}-both-{secrets.token_hex(2)}"
+    nc.mkcol(folder)
+    share_id, target = share_with(nc, folder, nc_bob)
+    mine = nc.create_bucket("/" + folder, f"mine-{secrets.token_hex(3)}")
+    theirs = nc_bob.create_bucket("/" + target, f"theirs-{secrets.token_hex(3)}")
+    k1, k2 = nc.create_key(mine["id"]), nc_bob.create_key(theirs["id"])
+    yield (folder, share_id,
+           (mine, S3Client(env.endpoint, k1["accessKey"], k1["secretKey"])),
+           (theirs, S3Client(env.endpoint, k2["accessKey"], k2["secretKey"])))
+    unshare(nc, share_id)
+    nc.remove(folder)
+
+
+def test_deleting_a_bucket_leaves_other_buckets_uploads_alone(nc, nc_bob, sql, shared_buckets):
+    """`.s3-uploads` belongs to the folder, and two users can each have a
+    bucket on it. Before the fix the whole scratch folder went with either
+    bucket, and the other one's upload ended in InvalidPart."""
+    folder, _, (mine, client), (theirs, bob) = shared_buckets
+    upload_id, etag = start_upload(client, mine["bucketName"], "obj", b"alice's part")
+    start_upload(bob, theirs["bucketName"], "obj", b"bob's part")
+
+    assert nc_bob.api("DELETE", f"/buckets/{theirs['id']}").status == 200
+    assert sql("SELECT COUNT(*) AS n FROM oc_s3api_uploads WHERE bucket_id = ?", theirs["id"]) == [{"n": 0}]
+
+    r = client.request("POST", mine["bucketName"], "obj", complete_body(etag), query={"uploadId": upload_id})
+    assert r.status == 200, r.body
+    assert client.get(mine["bucketName"], "obj").body == b"alice's part"
+    assert not nc.exists(f"{folder}/.s3-uploads")
+
+
+def test_bucket_on_a_read_only_share_can_still_be_deleted(nc, nc_bob, sql, shared_buckets):
+    """Its parts cannot be removed any more; that is logged, and the bucket
+    goes anyway -- its keys are gone by then."""
+    folder, share_id, _, (theirs, bob) = shared_buckets
+    start_upload(bob, theirs["bucketName"], "obj", b"bob's part")
+    r = nc.http("PUT", f"/ocs/v2.php/apps/files_sharing/api/v1/shares/{share_id}", b"permissions=1",
+                {"Content-Type": "application/x-www-form-urlencoded"})
+    assert r.status == 200, r.body
+
+    assert nc_bob.api("DELETE", f"/buckets/{theirs['id']}").status == 200
+    assert sql("SELECT COUNT(*) AS n FROM oc_s3api_uploads WHERE bucket_id = ?", theirs["id"]) == [{"n": 0}]
+    assert theirs["id"] not in [b["id"] for b in nc_bob.api("GET", "/buckets").json()]

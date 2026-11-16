@@ -1,7 +1,11 @@
-# php syntax on the oldest and newest PHP, then the integration suite
-# (tests/run.sh) against every Nextcloud major the app declares, 36 being the
-# daily master build. Also runs weekly, so a new image or a broken daily shows
-# up without a push. Master may fail without failing the whole run.
+# php syntax on the oldest and newest PHP, static analysis against OCP, then
+# the integration suite (tests/run.sh) against every Nextcloud major the app
+# declares, 36 being the daily master build, on SQLite -- and on MariaDB and
+# PostgreSQL for the oldest and newest stable major: the object lock and the
+# ETag table rest on how each database enforces a unique index, and MariaDB
+# answers contention on one with deadlocks the others never raise. Also runs
+# weekly, so a new image or a broken daily shows up without a push. Master may
+# fail without failing the whole run.
 name: test
 
 on:
@@ -28,8 +32,33 @@ jobs:
       - name: lint
         run: find s3_api -name '*.php' -print0 | xargs -0 -n1 php -l
 
+  phpstan:
+    name: phpstan
+    needs: lint
+    runs-on: ubuntu-24.04
+    container: docker.io/library/php:8.4-cli
+    steps:
+      - uses: actions/checkout@v7
+      # A fixed composer release, checked against its published sha256, and
+      # the dependencies from composer.lock: nothing here changes unless the
+      # repository does. `composer update` in tests/phpstan to move them.
+      - name: composer
+        env:
+          COMPOSER_VERSION: 2.11.2
+          COMPOSER_SHA256: dd158c0afd41d15fac89e1b4e47b5d42911fe316c3687cd5edac98319b25d028
+        run: |
+          apt-get -qq update && apt-get -qq install -y unzip git
+          curl -sSLo /usr/local/bin/composer "https://getcomposer.org/download/${COMPOSER_VERSION}/composer.phar"
+          echo "${COMPOSER_SHA256}  /usr/local/bin/composer" | sha256sum -c -
+          chmod +x /usr/local/bin/composer
+      - name: analyse
+        working-directory: tests/phpstan
+        run: |
+          composer install --quiet
+          php -d memory_limit=1G vendor/bin/phpstan analyse --no-progress
+
   integration:
-    name: nextcloud ${{ matrix.nc }}
+    name: nextcloud ${{ matrix.nc }} ${{ matrix.db }}
     needs: lint
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -38,6 +67,12 @@ jobs:
       fail-fast: false
       matrix:
         nc: ["33", "34", "35", "master"]
+        db: ["sqlite"]
+        include:
+          - { nc: "33", db: "mariadb" }
+          - { nc: "33", db: "postgres" }
+          - { nc: "35", db: "mariadb" }
+          - { nc: "35", db: "postgres" }
     steps:
       - uses: actions/checkout@v7
 
@@ -53,5 +88,6 @@ jobs:
       - name: tests/run.sh
         env:
           NC_VERSION: ${{ matrix.nc }}
+          DB: ${{ matrix.db }}
           GITS3: ${{ github.workspace }}/gits3srv/gits3.py
         run: tests/run.sh

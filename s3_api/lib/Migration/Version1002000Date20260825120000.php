@@ -16,8 +16,8 @@ use OCP\Migration\SimpleMigrationStep;
  * Conditional PUTs have to read the current ETag and write in one indivisible
  * step, otherwise two concurrent `If-None-Match: *` requests can both observe
  * "absent" and both succeed. `ILockingProvider` cannot be relied on for this:
- * without a configured distributed cache the server installs
- * NoopLockingProvider, which locks nothing.
+ * an admin can switch it off (`filelocking.enabled` false installs
+ * NoopLockingProvider, which locks nothing), and it does not wait for a lock.
  *
  * A unique index is atomic in every supported database, so inserting a row is
  * the lock acquisition and deleting it is the release.

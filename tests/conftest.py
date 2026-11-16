@@ -49,6 +49,7 @@ class Nextcloud:
     def __init__(self, base_url, user, password):
         self.base_url = base_url.rstrip("/")
         self.user = user
+        self.password = password
         token = base64.b64encode(f"{user}:{password}".encode()).decode()
         self.auth = f"Basic {token}"
 
@@ -296,10 +297,12 @@ def container():
     if not name:
         pytest.skip("no container to run commands in")
 
-    def run(*args, env=None):
+    def run(*args, env=None, stdin=None):
         flags = [f"--env={k}={v}" for k, v in (env or {}).items()]
+        if stdin is not None:
+            flags.append("--interactive")
         return subprocess.run([engine, "exec", "-u", "www-data", *flags, name, *args],
-                              capture_output=True, text=True, check=True).stdout
+                              input=stdin, capture_output=True, text=True, check=True).stdout
 
     return run
 
@@ -337,32 +340,34 @@ def datadir(occ):
     return occ("config:system:get", "datadirectory").strip()
 
 
-# One prepared statement against SQLite, parameters as JSON. Rows come back
-# as a list of dicts, anything else as the number of rows it touched.
+# One statement through Nextcloud's own database connection, so it runs
+# against whatever database the instance uses. Parameters as JSON on stdin --
+# a thousand rows of them pass the 128 KiB a single argument may have. Rows
+# come back as a list of dicts, anything else as the number of rows it touched.
 _SQL = r"""
-$db = new PDO('sqlite:' . $argv[1]);
-$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-$db->setAttribute(PDO::ATTR_TIMEOUT, 30);
-$stmt = $db->prepare($argv[2]);
-$stmt->execute(json_decode($argv[3], true));
-echo json_encode($stmt->columnCount() > 0 ? $stmt->fetchAll(PDO::FETCH_ASSOC) : $stmt->rowCount());
+require_once '/var/www/html/lib/base.php';
+$db = \OCP\Server::get(\OCP\IDBConnection::class);
+$params = json_decode(stream_get_contents(STDIN), true);
+if (preg_match('/^\s*SELECT\b/i', $argv[1]) === 1) {
+    $result = $db->executeQuery($argv[1], $params);
+    echo json_encode($result->fetchAllAssociative());
+    $result->closeCursor();
+} else {
+    echo json_encode($db->executeStatement($argv[1], $params));
+}
 """
 
 
 @pytest.fixture(scope="session")
-def sql(container, occ, datadir):
+def sql(container):
     """Run SQL against the instance's database.
 
     For state the API cannot produce on demand: rows old enough for the
     cleanup job, a lock left behind by a request that died. Tables carry the
-    default `oc_` prefix. tests/run.sh sets the instance up on SQLite; on
-    anything else this skips.
+    default `oc_` prefix; keep statements to SQL that SQLite, MariaDB and
+    PostgreSQL all understand, tests/run.sh runs on each.
     """
-    if occ("config:system:get", "dbtype").strip() != "sqlite3":
-        pytest.skip("needs the SQLite database tests/run.sh sets up")
-    path = f"{datadir}/{occ('config:system:get', 'dbname').strip()}.db"
-
     def run(statement, *params):
-        return json.loads(container("php", "-r", _SQL, "--", path, statement, json.dumps(params)))
+        return json.loads(container("php", "-r", _SQL, "--", statement, stdin=json.dumps(params)))
 
     return run

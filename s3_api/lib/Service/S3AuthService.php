@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace OCA\S3Api\Service;
 
-use OCA\S3Api\Db\BucketMapper;
 use OCP\AppFramework\Http;
 use OCP\IRequest;
 use OCP\IUserManager;
@@ -39,7 +38,6 @@ class S3AuthService {
 
 	public function __construct(
 		private ApiKeyService $apiKeyService,
-		private BucketMapper $bucketMapper,
 		private IUserManager $userManager,
 	) {
 	}
@@ -81,7 +79,12 @@ class S3AuthService {
 	}
 
 	/**
-	 * @return array{userId: string, bucketId: int, permission: string, accessKey: string, signedHeaders: string[], chunkVerifier: ?ChunkSignatureVerifier}
+	 * `query` is the query string exactly as the signature covered it. The
+	 * controller reads its parameters from there and nowhere else: a second
+	 * parser could disagree with this one about what a request says, and
+	 * then the signature would vouch for something the handler never sees.
+	 *
+	 * @return array{userId: string, bucketId: int, permission: string, accessKey: string, signedHeaders: string[], chunkVerifier: ?ChunkSignatureVerifier, query: array<string, string>}
 	 * @throws S3AuthException
 	 */
 	public function authenticate(IRequest $request): array {
@@ -92,7 +95,7 @@ class S3AuthService {
 			: $this->parseHeaderAuth((string)$request->getHeader('Authorization'));
 
 		try {
-			return $this->authenticateParsed($request, $parsed, $query);
+			return $this->authenticateParsed($request, $parsed, $query) + ['query' => $query];
 		} catch (S3AuthException $e) {
 			$e->setAccessKey($parsed['accessKey']);
 			throw $e;
@@ -200,7 +203,8 @@ class S3AuthService {
 	 * `parse_str()` is unusable here: it rewrites `.` and space in keys, drops
 	 * repeated keys and cannot represent a valueless parameter such as
 	 * `?acl`, all of which change the canonical request and therefore the
-	 * signature.
+	 * signature. It cannot express a valueless parameter such as `?uploads`
+	 * either, which is how subresources are named.
 	 *
 	 * @return array<string, string> decoded keys mapped to decoded values
 	 */

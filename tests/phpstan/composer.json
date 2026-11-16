@@ -1,0 +1,9 @@
+{
+	"description": "Static analysis of s3_api, see phpstan.neon. Not part of the app.",
+	"require-dev": {
+		"doctrine/dbal": "^3.9",
+		"nextcloud/ocp": "v33.0.9",
+		"phpstan/phpstan": "^2.1",
+		"symfony/console": "^6.4"
+	}
+}

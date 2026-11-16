@@ -15,6 +15,7 @@ use OCP\AppFramework\Http\JSONResponse;
 use OCP\DB\Exception as DbException;
 use OCP\EventDispatcher\IEventDispatcher;
 use OCP\IRequest;
+use OCP\Lockdown\ILockdownManager;
 use OCP\Log\Audit\CriticalActionPerformedEvent;
 use Psr\Log\LoggerInterface;
 
@@ -26,10 +27,28 @@ class SettingsApiController extends Controller {
 		private BucketService $bucketService,
 		private ApiKeyService $apiKeyService,
 		private IEventDispatcher $eventDispatcher,
+		private ILockdownManager $lockdownManager,
 		private LoggerInterface $logger,
 		private ?string $userId,
 	) {
 		parent::__construct($appName, $request);
+	}
+
+	/**
+	 * Refuse an app password that has no access to files.
+	 *
+	 * Such a token gets an empty filesystem from Nextcloud, but nothing here
+	 * touches the filesystem on the way to a new key -- and the key then
+	 * reaches the files without any token, so without the restriction. A
+	 * bucket names a way into the files and a key opens it, so the whole
+	 * API is off limits to such a token.
+	 */
+	private function refuseWithoutFilesystem(): ?JSONResponse {
+		if ($this->lockdownManager->canAccessFilesystem()) {
+			return null;
+		}
+
+		return new JSONResponse(['error' => 'This app password has no access to files'], Http::STATUS_FORBIDDEN);
 	}
 
 	/**
@@ -48,12 +67,22 @@ class SettingsApiController extends Controller {
 
 	#[NoAdminRequired]
 	public function listBuckets(): JSONResponse {
+		$refused = $this->refuseWithoutFilesystem();
+		if ($refused !== null) {
+			return $refused;
+		}
+
 		$buckets = $this->bucketService->listBucketsWithCurrentPaths($this->userId);
 		return new JSONResponse(array_map(fn($b) => $b->jsonSerialize(), $buckets));
 	}
 
 	#[NoAdminRequired]
 	public function createBucket(): JSONResponse {
+		$refused = $this->refuseWithoutFilesystem();
+		if ($refused !== null) {
+			return $refused;
+		}
+
 		$folderPath = $this->request->getParam('folderPath', '');
 		$bucketName = $this->request->getParam('bucketName', '');
 
@@ -99,6 +128,11 @@ class SettingsApiController extends Controller {
 
 	#[NoAdminRequired]
 	public function deleteBucket(int $id): JSONResponse {
+		$refused = $this->refuseWithoutFilesystem();
+		if ($refused !== null) {
+			return $refused;
+		}
+
 		try {
 			$bucket = $this->bucketService->deleteBucket($id, $this->userId);
 			$this->audit('S3 bucket "%s" and its keys deleted by user "%s"', [
@@ -113,6 +147,11 @@ class SettingsApiController extends Controller {
 
 	#[NoAdminRequired]
 	public function listKeys(int $bucketId): JSONResponse {
+		$refused = $this->refuseWithoutFilesystem();
+		if ($refused !== null) {
+			return $refused;
+		}
+
 		try {
 			$keys = $this->apiKeyService->listKeys($bucketId, $this->userId);
 			return new JSONResponse(array_map(fn($k) => $k->jsonSerialize(), $keys));
@@ -125,6 +164,11 @@ class SettingsApiController extends Controller {
 
 	#[NoAdminRequired]
 	public function createKey(int $bucketId): JSONResponse {
+		$refused = $this->refuseWithoutFilesystem();
+		if ($refused !== null) {
+			return $refused;
+		}
+
 		$permission = $this->request->getParam('permission', 'readonly');
 		$label = $this->request->getParam('label', '') ?? '';
 
@@ -164,6 +208,11 @@ class SettingsApiController extends Controller {
 
 	#[NoAdminRequired]
 	public function deleteKey(int $bucketId, int $keyId): JSONResponse {
+		$refused = $this->refuseWithoutFilesystem();
+		if ($refused !== null) {
+			return $refused;
+		}
+
 		try {
 			$key = $this->apiKeyService->deleteKey($keyId, $bucketId, $this->userId);
 			$this->audit('S3 access key "%s" of bucket %s deleted by user "%s"', [
